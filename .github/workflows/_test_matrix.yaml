@@ -173,6 +173,8 @@ env:
   CLONED_HF_ADAPTERS_DIR: ${{ github.workspace }}
   STORAGE_1_DIR: /storage-1/hf-adapters
   HF_HOME: /storage-1/hf-adapters/.cache/huggingface
+  # Registry models are pre-warmed in the HF_HOME PVC; offline mode skips the Hub revision-check request that from_pretrained() otherwise makes even on a cache hit.
+  HF_HUB_OFFLINE: "1"
   # Stock VLM logits/captions are independent of hf-adapters and expensive to
   # regenerate on CPU. The test keys these compact references by model commit,
   # stack versions, generation settings, dtype, prompt, and input tensor bytes.
