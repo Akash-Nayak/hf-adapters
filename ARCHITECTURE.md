@@ -184,7 +184,7 @@ all pass that check.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 39 adapters · 60 verified checkpoints · 10K+ compatible models.
+**Coverage:** 39 adapters · 61 verified checkpoints · 10K+ compatible models.
 The 61 verified rows are 38 generative + 13 embedding + 2 seq-classification +
 2 token-classification + 6 vision-language (see the Verified Checkpoints tables
 above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components

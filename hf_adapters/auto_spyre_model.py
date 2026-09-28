@@ -324,8 +324,12 @@ def dtype_for_model_path(
         config = _autoconfig_with_subfolder_fallback(
             model_name_or_path, trust_remote_code=trust_remote_code
         )
-        dtype_config = getattr(config, "text_config", None) or config
-        dtype = getattr(dtype_config, "dtype", None) or torch.float16
+        text_config = getattr(config, "text_config", None)
+        dtype = (
+            getattr(text_config, "dtype", None)
+            or getattr(config, "dtype", None)
+            or torch.float16
+        )
 
     if dtype == torch.float32 and device_str == "spyre":
         dtype = torch.float16
