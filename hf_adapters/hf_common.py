@@ -2021,7 +2021,7 @@ def _resolve_tp_plan(
         if auto_plan and grouped_colwise_policy is not None
         else {}
     )
-    return prepare_spyre_tp_plan(
+    plan = prepare_spyre_tp_plan(
         probe,
         plan,
         cpu_staged_modules=getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()),
@@ -2034,6 +2034,8 @@ def _resolve_tp_plan(
         replicated_embedding_modules=("model.embed_tokens",) if auto_plan else (),
         grouped_colwise_modules=grouped_colwise_modules,
     )
+    # Return cfg too so the caller's from_pretrained() can reuse it instead of re-fetching it from the Hub.
+    return plan, cfg
 
 
 def _resolve_tp_size():
@@ -2150,19 +2152,21 @@ def load_model_common(
     elif tp_plan is not None:
         from transformers.distributed import DistributedConfig
 
+        resolved_tp_plan, cfg = _resolve_tp_plan(
+            model_path,
+            auto_model_cls,
+            tp_plan,
+            adapter_module=module,
+            trust_remote_code=trust_remote_code,
+        )
         distributed_config = DistributedConfig(
             tp_size=_resolve_tp_size(),
-            tp_plan=_resolve_tp_plan(
-                model_path,
-                auto_model_cls,
-                tp_plan,
-                adapter_module=module,
-                trust_remote_code=trust_remote_code,
-            ),
+            tp_plan=resolved_tp_plan,
         )
         with _without_spyre_allocator_warmup(), _prefer_exact_tp_plan_entries():
             model = auto_model_cls.from_pretrained(
                 model_path,
+                config=cfg,
                 dtype=dtype,
                 distributed_config=distributed_config,
                 trust_remote_code=trust_remote_code,
