@@ -27,7 +27,9 @@ from pathlib import Path
 import yaml
 from huggingface_hub import snapshot_download
 
-MODEL_REGISTRY_PATH = Path(__file__).resolve().parents[2] / "tests" / "model_registry.py"
+MODEL_REGISTRY_PATH = (
+    Path(__file__).resolve().parents[2] / "tests" / "model_registry.py"
+)
 # Matches every `"path": "org/repo"` entry across the registry's model dicts.
 _PATH_ENTRY_RE = re.compile(r'"path":\s*"([^"]+)"')
 
