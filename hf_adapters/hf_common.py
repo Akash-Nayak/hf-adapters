@@ -694,10 +694,20 @@ def permute_proj_for_rope(proj, num_heads, head_dim, perm):
     """
     # TP may load the shard directly on Spyre, whose eager backend cannot perform the advanced indexing used by this one-time permutation.
     weight_device = proj.weight.device
+    weight_dtype = proj.weight.dtype
     w = proj.weight.data.to("cpu").view(num_heads, head_dim, -1)
-    proj.weight.data = (
-        w[:, perm, :].contiguous().view(num_heads * head_dim, -1).to(weight_device)
-    )
+    permuted_weight = w[:, perm, :].contiguous().view(num_heads * head_dim, -1)
+    if weight_device.type == "spyre":
+        from hf_adapters.spyre_tensor_parallel import _copy_linear
+
+        permuted_weight = _copy_linear(
+            permuted_weight,
+            dtype=weight_dtype,
+            device=weight_device,
+        )
+    else:
+        permuted_weight = permuted_weight.to(weight_device)
+    proj.weight = nn.Parameter(permuted_weight, requires_grad=False)
     if proj.bias is not None:
         bias_device = proj.bias.device
         b = proj.bias.data.to("cpu").view(num_heads, head_dim)

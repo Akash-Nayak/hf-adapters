@@ -34,6 +34,7 @@ from hf_adapters.hf_common import (
     moe_decode_selected_experts,
     moe_prefill_all_experts,
     optional_spyre_config_patch,
+    permute_proj_for_rope,
     prepare_lm_head_for_spyre,
     prepare_moe_expert_weights,
     text_config,
@@ -146,29 +147,6 @@ def _normalize_ffn_input(residual, post_attention_norm):
     return _rms_norm(residual, post_attention_norm).reshape(-1, hidden_size)
 
 
-def _permute_proj_for_rope_cpu(proj, num_heads, head_dim, perm):
-    """Permute Q/K outputs on CPU, including TP-loaded Spyre parameters."""
-    weight_device = proj.weight.device
-    weight = proj.weight.detach().cpu().view(num_heads, head_dim, -1)
-    permuted_weight = weight[:, perm, :].contiguous().view(num_heads * head_dim, -1)
-    if weight_device.type == "spyre":
-        from torch_spyre.model_utils import _dma_to_spyre_dim_order_swapped
-
-        permuted_weight = _dma_to_spyre_dim_order_swapped(
-            permuted_weight,
-            target_dtype=proj.weight.dtype,
-            device=weight_device,
-        )
-    else:
-        permuted_weight = permuted_weight.to(weight_device)
-    proj.weight = nn.Parameter(permuted_weight, requires_grad=False)
-    if proj.bias is not None:
-        bias_device = proj.bias.device
-        bias = proj.bias.detach().cpu().view(num_heads, head_dim)
-        permuted_bias = bias[:, perm].contiguous().view(-1).to(bias_device)
-        proj.bias = nn.Parameter(permuted_bias, requires_grad=False)
-
-
 def _decode_routed_experts(
     x,
     weights,
@@ -193,8 +171,9 @@ def _prefill_routed_experts(x, routing_weight, mlp):
 
 
 def _finish_ffn(residual, x, routed, mlp, tp_group_name=None):
-    output = routed + _shared_expert(x, mlp)
-    output = _reduce_expert_output_fp32(output, tp_group_name)
+    shared = _shared_expert(x, mlp)
+    routed = _reduce_expert_output_fp32(routed, tp_group_name)
+    output = routed + shared
     return residual + output.to(residual.dtype).reshape_as(residual)
 
 
@@ -454,13 +433,13 @@ def prepare_for_spyre(model):
             )
             layer.self_attn.q_proj = nn.Identity()
             if rope_permutation is not None:
-                _permute_proj_for_rope_cpu(
+                permute_proj_for_rope(
                     query_projection,
                     local_query_heads,
                     cfg.head_dim,
                     rope_permutation,
                 )
-                _permute_proj_for_rope_cpu(
+                permute_proj_for_rope(
                     layer.self_attn.k_proj,
                     local_kv_heads,
                     cfg.head_dim,
