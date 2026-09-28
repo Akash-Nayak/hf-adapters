@@ -40,6 +40,7 @@ from hf_adapters.hf_common import (
 )
 from hf_adapters.hf_qwen3_5 import (
     _allocate_caches,
+    _prepare_linear_attention_constants,
     _rms_norm,
     _split_gated_q_projection,
 )
@@ -491,55 +492,7 @@ def prepare_for_spyre(model):
                 )
             )
         else:
-            conv_weight = torch.zeros(
-                1,
-                layer.linear_attn.conv_dim,
-                BLOCK_SIZE,
-                dtype=layer.linear_attn.conv1d.weight.dtype,
-                device="cpu",
-            )
-            conv_weight[..., -layer.linear_attn.conv_kernel_size :] = (
-                layer.linear_attn.conv1d.weight[:, 0, :].to("cpu")
-            )
-            layer.linear_attn._spyre_conv_weight = nn.Parameter(
-                conv_weight, requires_grad=False
-            )
-            layer.linear_attn._spyre_conv_taps = nn.ParameterList(
-                nn.Parameter(conv_weight[..., index, None], requires_grad=False)
-                for index in range(
-                    BLOCK_SIZE - layer.linear_attn.conv_kernel_size, BLOCK_SIZE
-                )
-            )
-            shift_matrices = torch.zeros(
-                layer.linear_attn.conv_kernel_size - 1,
-                2 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                dtype=conv_weight.dtype,
-            )
-            for lag in range(1, layer.linear_attn.conv_kernel_size):
-                shift_matrices[
-                    lag - 1,
-                    BLOCK_SIZE - lag : 2 * BLOCK_SIZE - lag,
-                    :,
-                ] = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
-            layer.linear_attn._spyre_conv_shift_matrices = nn.Parameter(
-                shift_matrices, requires_grad=False
-            )
-            identity = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
-            decode_matrices = []
-            for lag in range(1, layer.linear_attn.conv_kernel_size):
-                selector = torch.zeros(BLOCK_SIZE, 1, dtype=conv_weight.dtype)
-                selector[-lag, 0] = 1
-                decode_matrices.append(selector)
-            shift_state = torch.roll(identity, -1, dims=1)
-            shift_state[0, -1] = 0
-            append_token = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=conv_weight.dtype)
-            append_token[0, -1] = 1
-            decode_matrices.extend((shift_state, append_token))
-            layer.linear_attn._spyre_conv_decode_matrices = nn.ParameterList(
-                nn.Parameter(matrix, requires_grad=False) for matrix in decode_matrices
-            )
-            layer.linear_attn.conv1d = nn.Identity()
+            _prepare_linear_attention_constants(layer.linear_attn)
             compiled_blocks.append(
                 _make_linear_attention_block(
                     layer,

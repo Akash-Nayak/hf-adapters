@@ -173,7 +173,9 @@ def _causal_conv_decode(x, conv_state, taps, decode_matrices):
     return F.silu(output[..., : x.shape[-1]]), new_state
 
 
-def _delta_recurrence(query, key, value, a, beta, recurrent_state, a_log, dt_bias):
+def _delta_recurrence(
+    query, key, value, a, beta, recurrent_state, a_log_cpu, dt_bias_cpu
+):
     """Run the stateful delta rule on CPU, outside Spyre compiled graphs."""
     output_device = value.device
     output_dtype = value.dtype
@@ -181,9 +183,7 @@ def _delta_recurrence(query, key, value, a, beta, recurrent_state, a_log, dt_bia
     key = key.to("cpu", torch.float32)
     value = value.to("cpu", torch.float32)
     a = a.to("cpu", torch.float32)
-    decay = -a_log.to("cpu", torch.float32).exp() * F.softplus(
-        a + dt_bias.to("cpu", torch.float32)
-    )
+    decay = -a_log_cpu.exp() * F.softplus(a + dt_bias_cpu)
     beta = beta.to("cpu", torch.float32)
     state = recurrent_state.to("cpu", torch.float32)
     batch_size, sequence_length, num_heads, key_dim = query.shape
@@ -299,18 +299,13 @@ def _make_linear_attention_block(layer):
         return conv_output
 
     def conv_decode(mixed_qkv, conv_state):
-        output_device = mixed_qkv.device
-        output_dtype = mixed_qkv.dtype
         output, new_state = _causal_conv_decode(
             mixed_qkv.to("cpu"),
             conv_state.to("cpu"),
-            [tap.to("cpu") for tap in linear_attn._spyre_conv_taps],
-            [matrix.to("cpu") for matrix in linear_attn._spyre_conv_decode_matrices],
+            linear_attn._spyre_conv_taps_cpu,
+            linear_attn._spyre_conv_decode_matrices_cpu,
         )
-        return (
-            output.to(output_device, output_dtype),
-            new_state.to(output_device, output_dtype),
-        )
+        return output, new_state.to(conv_state.device, conv_state.dtype)
 
     return (
         torch.compile(project_hidden, dynamic=False),
@@ -430,11 +425,12 @@ def _run_backbone_forward(
             h = project_hidden(hidden_states, padding_mask)
             mixed_qkv, z, beta, a = project_values(h)
             if decode:
-                conv_output, new_conv_state = conv(mixed_qkv, conv_state)
+                conv_output_cpu, new_conv_state = conv(mixed_qkv, conv_state)
             else:
                 conv_output = conv(mixed_qkv, conv_state)
+                conv_output_cpu = conv_output.to("cpu")
                 new_conv_state = mixed_qkv
-            query, key, value = split_inputs(conv_output.to("cpu"))
+            query, key, value = split_inputs(conv_output_cpu)
             query, key, value = normalize_inputs(query, key, value)
             linear_attn = get_backbone(model).layers[index].linear_attn
             core_output, new_recurrent_state = _delta_recurrence(
@@ -444,8 +440,8 @@ def _run_backbone_forward(
                 a,
                 beta,
                 recurrent_state,
-                linear_attn.A_log,
-                linear_attn.dt_bias,
+                linear_attn._spyre_a_log_cpu,
+                linear_attn._spyre_dt_bias_cpu,
             )
             core_output = finish_norm(z, core_output.to(z.device, z.dtype))
             hidden_states = finish_projection(residual, core_output)
@@ -535,6 +531,55 @@ def _allocate_caches(model, batch_size, max_cache_len, dtype, device):
     return key_caches, value_caches
 
 
+def _prepare_linear_attention_constants(linear_attn):
+    conv_weight = linear_attn.conv1d.weight[:, 0, :].detach().to("cpu")
+    taps_cpu = tuple(
+        conv_weight[:, index].reshape(1, -1, 1).contiguous()
+        for index in range(linear_attn.conv_kernel_size)
+    )
+    linear_attn._spyre_conv_taps = nn.ParameterList(
+        nn.Parameter(tap.clone(), requires_grad=False) for tap in taps_cpu
+    )
+    # Plain tensor attributes stay on CPU when the registered model state moves.
+    linear_attn._spyre_conv_taps_cpu = tuple(tap.clone() for tap in taps_cpu)
+
+    shift_matrices = torch.zeros(
+        linear_attn.conv_kernel_size - 1,
+        2 * BLOCK_SIZE,
+        BLOCK_SIZE,
+        dtype=conv_weight.dtype,
+    )
+    for lag in range(1, linear_attn.conv_kernel_size):
+        shift_matrices[
+            lag - 1,
+            BLOCK_SIZE - lag : 2 * BLOCK_SIZE - lag,
+            :,
+        ] = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
+    linear_attn._spyre_conv_shift_matrices = nn.Parameter(
+        shift_matrices, requires_grad=False
+    )
+
+    identity = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
+    decode_matrices = []
+    for lag in range(1, linear_attn.conv_kernel_size):
+        selector = torch.zeros(BLOCK_SIZE, 1, dtype=conv_weight.dtype)
+        selector[-lag, 0] = 1
+        decode_matrices.append(selector)
+    shift_state = torch.roll(identity, -1, dims=1)
+    shift_state[0, -1] = 0
+    append_token = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=conv_weight.dtype)
+    append_token[0, -1] = 1
+    decode_matrices.extend((shift_state, append_token))
+    linear_attn._spyre_conv_decode_matrices_cpu = tuple(decode_matrices)
+    linear_attn._spyre_a_log_cpu = (
+        linear_attn.A_log.detach().to("cpu", torch.float32).clone().contiguous()
+    )
+    linear_attn._spyre_dt_bias_cpu = (
+        linear_attn.dt_bias.detach().to("cpu", torch.float32).clone().contiguous()
+    )
+    linear_attn.conv1d = nn.Identity()
+
+
 def prepare_for_spyre(model):
     """Apply dense text-only Qwen3.5 adaptations in-place."""
     cfg = text_config(model.config)
@@ -618,55 +663,7 @@ def prepare_for_spyre(model):
                 )
             )
         else:
-            conv_weight = torch.zeros(
-                1,
-                layer.linear_attn.conv_dim,
-                BLOCK_SIZE,
-                dtype=layer.linear_attn.conv1d.weight.dtype,
-                device="cpu",
-            )
-            conv_weight[..., -layer.linear_attn.conv_kernel_size :] = (
-                layer.linear_attn.conv1d.weight[:, 0, :].to("cpu")
-            )
-            layer.linear_attn._spyre_conv_weight = nn.Parameter(
-                conv_weight, requires_grad=False
-            )
-            layer.linear_attn._spyre_conv_taps = nn.ParameterList(
-                nn.Parameter(conv_weight[..., index, None], requires_grad=False)
-                for index in range(
-                    BLOCK_SIZE - layer.linear_attn.conv_kernel_size, BLOCK_SIZE
-                )
-            )
-            shift_matrices = torch.zeros(
-                layer.linear_attn.conv_kernel_size - 1,
-                2 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                dtype=conv_weight.dtype,
-            )
-            for lag in range(1, layer.linear_attn.conv_kernel_size):
-                shift_matrices[
-                    lag - 1,
-                    BLOCK_SIZE - lag : 2 * BLOCK_SIZE - lag,
-                    :,
-                ] = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
-            layer.linear_attn._spyre_conv_shift_matrices = nn.Parameter(
-                shift_matrices, requires_grad=False
-            )
-            identity = torch.eye(BLOCK_SIZE, dtype=conv_weight.dtype)
-            decode_matrices = []
-            for lag in range(1, layer.linear_attn.conv_kernel_size):
-                selector = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=conv_weight.dtype)
-                selector[-lag, 0] = 1
-                decode_matrices.append(selector)
-            shift_state = torch.roll(identity, -1, dims=1)
-            shift_state[0, -1] = 0
-            append_token = torch.zeros(BLOCK_SIZE, BLOCK_SIZE, dtype=conv_weight.dtype)
-            append_token[0, -1] = 1
-            decode_matrices.extend((shift_state, append_token))
-            layer.linear_attn._spyre_conv_decode_matrices = nn.ParameterList(
-                nn.Parameter(matrix, requires_grad=False) for matrix in decode_matrices
-            )
-            layer.linear_attn.conv1d = nn.Identity()
+            _prepare_linear_attention_constants(layer.linear_attn)
             compiled_blocks.append(_make_linear_attention_block(layer))
 
     model._spyre_compiled_blocks = compiled_blocks
