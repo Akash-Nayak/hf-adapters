@@ -60,18 +60,16 @@ class FP8Linear(nn.Module):
         out_shape = (*x.shape[:-1], self.out_features)
 
         if x.device.type == "spyre":
-            # Fused per-token scale (torch-spyre#3457). clone() gives x_scale a
-            # fresh layout; inherited rank-reducing ancestry otherwise breaks
-            # the multi-arg rescale in layout propagation.
-            x_scale = torch.ops.spyre.quantscalepertokenfp8(x, FP8_MAX).clone()
-            # clone() gives x_scale a fresh layout; inherited rank-reducing
-            # ancestry (e.g. o_proj's input) otherwise breaks the multi-arg
-            # rescale in layout propagation.
-            # x_scale = (
-            #     (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX))
-            #     .clamp(min=SCALE_EPS)
-            #     .clone()
-            # )
+            # Per-token activation scale via standard ops.
+            # quantscalepertokenfp8 (torch-spyre#3457) is avoided: it emits a
+            # quantization_double_pad.ddl kernel whose output loop dimension
+            # (last-dim=1) is "marked to be dropped" by dbo-opt — firmware bug.
+            # abs().amax() decomposes into separate kernels that avoid that DDL.
+            x_scale = (
+                (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX))
+                .clamp(min=SCALE_EPS)
+                .clone()
+            )
             wq = (
                 self.weight
                 if self.prequantized
@@ -83,7 +81,17 @@ class FP8Linear(nn.Module):
             y = torch.ops.spyre.scaled_mm(
                 xq.reshape(-1, xq.shape[-1]), wq, out_dtype=self.compute_dtype
             )
-            y = y.reshape(out_shape) * x_scale * self.weight_scale
+            # Cast scale tensors to compute_dtype so the multiply stays in
+            # f16/bf16.  Mixed-dtype mul (bf16 x_scale × f16 y) would promote
+            # to fp32, generating a dead f32[1,1,1] dl16tofp32 sdsc kernel
+            # whose single-element output stick causes a dbo-opt DDL crash
+            # ("dimension marked to be dropped" in quantization_double_pad.ddl).
+            dtype = self.compute_dtype
+            y = (
+                y.reshape(out_shape)
+                * x_scale.to(dtype)
+                * self.weight_scale.to(dtype)
+            )
             return y.to(x.dtype)
 
         # CPU reference path; fp32 accumulation avoids fp16 overflow.
