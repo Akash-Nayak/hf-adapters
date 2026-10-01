@@ -26,9 +26,10 @@ FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
 SCALE_EPS = 1e-4  # CPU path: keeps reciprocal(x_scale) finite for all-zero rows
 
-# TODO: o_proj and down_proj fail torch-spyre FP8 codegen (DtException on
-# o_proj, ReStickifyOpHBM on SEN143_FP8 for down_proj); kept fp16 until fixed.
-DEFAULT_FP8_EXCLUDE = ("o_proj", "down_proj")
+# o_proj and down_proj exclusions removed: the underlying DtException /
+# ReStickifyOpHBM bugs are fixed in torch-spyre
+# feature/prequantized-fp8-weight-support (commit 8a0b32e8).
+DEFAULT_FP8_EXCLUDE: tuple[str, ...] = ()
 
 
 class FP8Linear(nn.Module):
