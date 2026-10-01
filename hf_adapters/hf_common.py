@@ -1971,6 +1971,7 @@ def generate(
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
+    return_timings=False,
     prefill_fn: Optional[Callable] = None,
     decode_fn: Optional[Callable] = None,
     token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
@@ -2291,7 +2292,7 @@ def generate(
         )
         if collect_scores:
             generation_scores.append(processed_scores)
-        if timing:
+        if timing or return_timings:
             times_list.append(time.time() - t0)
 
         # Finished rows emit padding while unfinished rows continue. Mask using
@@ -2324,13 +2325,17 @@ def generate(
     else:
         sequences = orig_input_ids.to(torch.long)
     if not cfg.return_dict_in_generate:
-        return sequences
-    return GenerateDecoderOnlyOutput(
-        sequences=sequences,  # type: ignore[arg-type]
-        scores=tuple(generation_scores) if generation_scores else None,
-        logits=tuple(generation_logits) if generation_logits else None,
-        past_key_values=None,
-    )
+        output = sequences
+    else:
+        output = GenerateDecoderOnlyOutput(
+            sequences=sequences,  # type: ignore[arg-type]
+            scores=tuple(generation_scores) if generation_scores else None,
+            logits=tuple(generation_logits) if generation_logits else None,
+            past_key_values=None,
+        )
+    if return_timings:
+        return output, times_list
+    return output
 
 
 # ---------------------------------------------------------------------------
