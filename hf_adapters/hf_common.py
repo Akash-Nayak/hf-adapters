@@ -1489,12 +1489,28 @@ def get_model_dtype(model: nn.Module) -> torch.dtype:
     return torch.float16
 
 
+def _has_fp8_prequantized_linears(model: nn.Module) -> bool:
+    """Return True if any FP8Linear in the model is already prequantized (direct-load path)."""
+    try:
+        from hf_adapters.fp8_linear import FP8Linear
+    except ImportError:
+        return False
+    return any(
+        isinstance(m, FP8Linear) and m.prequantized
+        for _, m in model.named_modules()
+    )
+
+
 def _move_to_spyre_with_layout(model, dtype):
     """Prepare RoPE then transfer the model to Spyre via torch-spyre.
 
-    Layout selection (``dim_order=[1,0]`` for ``nn.Linear`` weights) is owned by
-    ``torch_spyre.model_utils.load_model_to_spyre``. This wrapper only handles
-    HF-specific RoPE prep before the device move.
+    Layout selection is owned by ``torch_spyre.model_utils.load_model_to_spyre``.
+    This wrapper only handles HF-specific RoPE prep before the device move.
+
+    When the model has FP8Linear modules with ``prequantized=True`` (direct-load
+    path), ``load_fp8_model_to_spyre`` is used so that E4M3 weights are DMA'd
+    directly into QFP8WT/KERNEL layout — bypassing the dequantize→fp16→device
+    →re-quantize round-trip of the older path.
     """
     # Propagate dtype to the precomputed RoPE module(s) so the freq cache
     # matches the chosen weight dtype (avoids fp16/bf16 mismatch in
@@ -1505,6 +1521,19 @@ def _move_to_spyre_with_layout(model, dtype):
     # to its lazy first-forward build, the construction ops run inside the Spyre
     # graph and corrupt the result (see prebuild_rope_cache). Harmless on CPU.
     prebuild_rope_cache(model)
+
+    if _has_fp8_prequantized_linears(model):
+        # Direct-load path: E4M3 weights already in FP8Linear with prequantized=True.
+        # Use load_model_to_spyre(use_fp8_weights=True) so E4M3 weights land in
+        # QFP8WT/KERNEL layout directly, while non-FP8 params (excluded fp16
+        # linears, layer norms, embeddings) are cast to `dtype` — matching the
+        # activation dtype so there's no bfloat16/float16 mismatch at o_proj.
+        try:
+            from torch_spyre.model_utils import load_model_to_spyre
+            load_model_to_spyre(model, dtype=dtype, use_fp8_weights=True)
+            return
+        except ImportError:
+            pass  # torch_spyre not installed (CPU test) — fall through to .to()
 
     model.to(dtype=dtype, device=DEVICE)
 
@@ -1631,15 +1660,24 @@ def load_model_common(
 
 
 def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
-    from hf_adapters.fp8_linear import prequantize_fp8_weights
+    from hf_adapters.fp8_linear import FP8Linear, prequantize_fp8_weights
 
     untie_embedding_and_lm_head(model)
     module.prepare_for_spyre(model)
     _move_to_spyre_with_layout(model, dtype)
     for submod_name in getattr(model, "_spyre_cpu_submodules", []):
         model.get_submodule(submod_name).to("cpu")
-    # No-op without FP8Linear. Last, so device placement is final.
-    prequantize_fp8_weights(model)
+    # Skip prequantize_fp8_weights when all FP8Linear modules are already
+    # prequantized (direct-load path via FP8Linear.from_fp8_checkpoint +
+    # load_fp8_model_to_spyre).  The on-device re-quantization step is only
+    # needed for the legacy fp16 round-trip path.
+    all_prequantized = all(
+        m.prequantized
+        for _, m in model.named_modules()
+        if isinstance(m, FP8Linear)
+    )
+    if not all_prequantized:
+        prequantize_fp8_weights(model)
     print("Model on Spyre ready.")
 
 

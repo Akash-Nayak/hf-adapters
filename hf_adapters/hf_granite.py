@@ -107,14 +107,20 @@ def prepare_for_spyre(model):
     """Apply Spyre adaptations to Granite 3.3 model in-place."""
     backbone = get_backbone(model)
     # FP8 checkpoints only; runs before the blocks are built so they close over
-    # FP8Linear.
-    n_fp8, n_excluded = swap_linears_to_fp8(model)
+    # FP8Linear.  direct_load=True keeps E4M3 weights as-is (prequantized=True)
+    # so load_fp8_model_to_spyre can DMA them straight into QFP8WT/KERNEL layout
+    # without any dequantize→fp16→device→re-quantize round-trip.
+    # Use the model's config dtype for excluded linears (o_proj, down_proj) so
+    # they match the activation dtype — avoids bfloat16/float16 mismatch.
+    cfg_dtype = getattr(model.config, "torch_dtype", None) or getattr(
+        model.config, "dtype", torch.float16
+    )
+    n_fp8, n_excluded = swap_linears_to_fp8(model, direct_load=True, dtype=cfg_dtype)
     if n_fp8 or n_excluded:
-        print(f"FP8: {n_fp8} module(s) -> FP8Linear, {n_excluded} -> fp16 nn.Linear")
+        print(f"FP8: {n_fp8} module(s) -> FP8Linear (direct E4M3), {n_excluded} -> {cfg_dtype} nn.Linear")
     if n_fp8:
-        # TODO: stock RMSNorm's fp32->fp16 cast leaves torch-spyre no feasible
-        # layout for the FP8 scaled_mm that consumes it; keep the norms feeding
-        # FP8Linear in fp16 until that is fixed.
+        # Stock RMSNorm promotes to fp32 for variance; keep norms feeding FP8Linear
+        # in fp16 so the layout chain to scaled_mm remains feasible on Spyre.
         for layer in backbone.layers:
             for norm in (layer.input_layernorm, layer.post_attention_layernorm):
                 norm.forward = types.MethodType(_fp16_rmsnorm_forward, norm)
