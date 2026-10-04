@@ -1317,7 +1317,9 @@ def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
     ]
 
 
-def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
+def _cache_position_first_stl(
+    batch_size, num_kv_heads, max_cache_len, head_dim, dtype, element_arrangement=None
+):
     """Device layout for a ``[B, n_kv, L, hd]`` cache with ``L`` OUTERMOST on device.
 
     Indirect access (gather/scatter) requires the indexed dimension — here the
@@ -1333,6 +1335,14 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
     Note the logical dim order does NOT control the device order — logically
     permuting the cache moves the indexed dim *further* from device position 0
     (measured: 1 -> 2 -> 3). It has to be stated explicitly here.
+
+    Args:
+        element_arrangement: Optional ``ElementArrangement`` to stamp on the
+            returned STL (4th positional arg to ``SpyreTensorLayout``).  Pass
+            ``ElementArrangement.QFP8CH`` for the FP8 key cache so that the
+            on-device element order matches the output of
+            ``quantize_fp8_with_scale`` and the input expected by ``fp8todl16``.
+            Defaults to ``None`` (omitted → ``STANDARD``).
 
     Returns ``None`` when torch-spyre is unavailable (CPU runs), so callers fall
     back to a plain allocation.
@@ -1352,16 +1362,21 @@ def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim,
     shape = [batch_size, num_kv_heads, max_cache_len, head_dim]
     eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
     sticks = (head_dim + eps - 1) // eps
+    device_size = [max_cache_len, num_kv_heads, sticks, batch_size, eps]
+    stride_map = [
+        head_dim,  # L
+        max_cache_len * head_dim,  # n_kv
+        eps,  # stick count
+        num_kv_heads * max_cache_len * head_dim,  # B
+        1,  # elems per stick
+    ]
+    device_dtype = get_device_dtype(dtype)
+    if element_arrangement is not None:
+        return SpyreTensorLayout(device_size, stride_map, device_dtype, element_arrangement)
     return SpyreTensorLayout(
-        device_size=[max_cache_len, num_kv_heads, sticks, batch_size, eps],
-        stride_map=[
-            head_dim,  # L
-            max_cache_len * head_dim,  # n_kv
-            eps,  # stick count
-            num_kv_heads * max_cache_len * head_dim,  # B
-            1,  # elems per stick
-        ],
-        device_dtype=get_device_dtype(dtype),
+        device_size=device_size,
+        stride_map=stride_map,
+        device_dtype=device_dtype,
     )
 
 
@@ -1440,6 +1455,41 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
         for (n_kv, _hd, vhd) in shapes
     ]
     return key_caches, value_caches
+
+
+def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
+    """Allocate per-layer FP8 KV cache tensors for use with ``Fp8KVStandardGQABlock``.
+
+    Returns ``(key_caches, key_scale_caches, value_caches)`` where:
+
+    * ``key_caches[i]``       — ``[B, n_kv, L, head_dim]`` ``float8_e4m3fn``
+    * ``key_scale_caches[i]`` — ``[B, n_kv, L, head_dim]`` ``dtype`` (per-token K scale, broadcast across head_dim)
+    * ``value_caches[i]``     — ``[B, n_kv, L, head_dim]`` ``dtype``
+
+    ``dtype`` is the compute dtype (BF16 or FP16) used for activations and V.
+    """
+    from hf_adapters.fp8_kv_cache import allocate_fp8_kv_cache_tensors
+
+    if device is None:
+        device = DEVICE
+    shapes = kv_cache_shapes(model)
+    key_caches = []
+    key_scale_caches = []
+    value_caches = []
+    for (n_kv, hd, vhd) in shapes:
+        kc, ksc, vc = allocate_fp8_kv_cache_tensors(
+            batch_size, n_kv, max_cache_len, hd, dtype, device
+        )
+        key_caches.append(kc)
+        key_scale_caches.append(ksc)
+        # V uses vhd (may differ from hd for models like Gemma 4)
+        if vhd != hd:
+            _, _, vc = allocate_fp8_kv_cache_tensors(
+                batch_size, n_kv, max_cache_len, vhd, dtype, device
+            )
+        value_caches.append(vc)
+    return key_caches, key_scale_caches, value_caches
+
 
 
 # ---------------------------------------------------------------------------
@@ -1678,6 +1728,14 @@ def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
     )
     if not all_prequantized:
         prequantize_fp8_weights(model)
+    # Verify post-device-move weight dtypes — confirms E4M3 survived DMA.
+    from hf_adapters.fp8_linear import fp8_status
+    st = fp8_status(model)
+    if st["n_fp8"]:
+        print(
+            f"[fp8_status] n_fp8={st['n_fp8']}  n_prequantized={st['n_prequantized']}"
+            f"  n_weight_fp8={st['n_weight_fp8']}  orientation_ok={st['orientation_ok']}"
+        )
     print("Model on Spyre ready.")
 
 
@@ -2176,9 +2234,16 @@ def generate(
     # otherwise a single uniform shape derived from the config.
     # Match KV cache and mask dtype to the model's weight dtype.
     model_d_type = get_model_dtype(model)
-    key_caches, value_caches = allocate_kv_caches(
-        model, batch_size, max_cache_len, model_d_type
-    )
+    use_fp8_kv = getattr(model, "_spyre_fp8_kv_cache", False)
+    if use_fp8_kv:
+        key_caches, key_scale_caches, value_caches = allocate_fp8_kv_caches(
+            model, batch_size, max_cache_len, model_d_type
+        )
+    else:
+        key_caches, value_caches = allocate_kv_caches(
+            model, batch_size, max_cache_len, model_d_type
+        )
+        key_scale_caches = None
 
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
@@ -2217,7 +2282,7 @@ def generate(
                     prompt_offsets,
                     dtype=model_d_type,
                 )
-                logits = prefill_fn(
+                prefill_kwargs: dict = dict(
                     model=model,
                     input_ids=input_ids,
                     position_ids=position_ids,
@@ -2227,10 +2292,23 @@ def generate(
                     cache_index=make_cache_index(0, padded_len, DEVICE),
                     **normalized_token_inputs,
                 )
+                if key_scale_caches is not None:
+                    prefill_key_scale_caches = _prefill_cache_inputs(
+                        key_scale_caches, prefill_kv_len, chunked_prefill
+                    )
+                    prefill_kwargs["key_scale_caches"] = prefill_key_scale_caches
+                logits = prefill_fn(**prefill_kwargs)
             else:
                 # Keep Lk fixed at the complete prefill extent while advancing
                 # Lq. Future cache slots are zero and masked, and fixed shapes
                 # avoid compiling one attention graph for every prefix length.
+                prefill_key_scale_caches = (
+                    _prefill_cache_inputs(
+                        key_scale_caches, prefill_kv_len, chunked_prefill
+                    )
+                    if key_scale_caches is not None
+                    else None
+                )
                 for chunk_start in range(0, padded_len, query_chunk_size):
                     chunk_end = chunk_start + query_chunk_size
                     prefill_mask = build_prefill_mask(
@@ -2241,6 +2319,13 @@ def generate(
                         dtype=model_d_type,
                         query_start=chunk_start,
                     )
+                    fwd_kwargs: dict = dict(
+                        cache_index=make_cache_index(
+                            chunk_start, query_chunk_size, DEVICE
+                        ),
+                    )
+                    if prefill_key_scale_caches is not None:
+                        fwd_kwargs["key_scale_caches"] = prefill_key_scale_caches
                     logits = run_forward_fn(  # type: ignore[misc]
                         model,
                         input_ids[:, chunk_start:chunk_end].to(DEVICE),
@@ -2248,9 +2333,7 @@ def generate(
                         prefill_mask.to(DEVICE),
                         prefill_key_caches,
                         prefill_value_caches,
-                        cache_index=make_cache_index(
-                            chunk_start, query_chunk_size, DEVICE
-                        ),
+                        **fwd_kwargs,
                     )
             # Only the last chunk's logits matter for next-token selection.
             next_logits = logits.to("cpu")[:, -1, :]
@@ -2280,6 +2363,9 @@ def generate(
                 )
             cache_index = make_cache_index(current_cache_len, 1, DEVICE)
             if decode_fn is None:
+                decode_fwd_kwargs: dict = dict(cache_index=cache_index)
+                if key_scale_caches is not None:
+                    decode_fwd_kwargs["key_scale_caches"] = key_scale_caches
                 logits = run_forward_fn(  # type: ignore[misc]
                     model,
                     next_input,
@@ -2287,10 +2373,10 @@ def generate(
                     decode_mask.to(DEVICE),
                     key_caches,
                     value_caches,
-                    cache_index=cache_index,
+                    **decode_fwd_kwargs,
                 )
             else:
-                logits = decode_fn(
+                decode_kwargs: dict = dict(
                     model=model,
                     input_ids=next_input,
                     position_ids=decode_pos.to(DEVICE),
@@ -2299,6 +2385,9 @@ def generate(
                     value_caches=value_caches,
                     cache_index=cache_index,
                 )
+                if key_scale_caches is not None:
+                    decode_kwargs["key_scale_caches"] = key_scale_caches
+                logits = decode_fn(**decode_kwargs)
             next_logits = logits.to("cpu")[:, -1, :]
             current_cache_len += 1
 
@@ -2627,6 +2716,178 @@ def prepare_standard_gqa_blocks(layers, is_res_mul: bool | None = None):
         layers[i] = block
         blocks.append(block)
     return blocks
+
+
+
+class Fp8KVStandardGQAAttention(StandardGQAAttention):
+    """``StandardGQAAttention`` variant that stores K as FP8 and runs QK^T in FP8.
+
+    The cache triple passed to ``pre_attn`` / ``attn_core`` is
+    ``(key_cache_fp8, key_scale_cache, value_cache)`` instead of the usual
+    ``(key_cache, value_cache)``.  ``StandardGQABlock`` is unaware of this
+    change — the extra tensor is absorbed into the cache tuple that the block
+    threads through unchanged.
+
+    ``pre_attn`` returns ``(q, key_cache, key_scale_cache, value_cache)``
+    so that ``StandardGQABlock._region_attention_tail`` receives them.
+    """
+
+    def pre_attn(
+        self,
+        hidden_states,
+        selected_freqs,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        cache_index,
+    ):
+        from hf_adapters.fp8_kv_cache import fp8_kv_cache_update
+
+        bsz, seq_len, _ = hidden_states.shape
+        q = (
+            self.q_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden_states)
+            .view(bsz, seq_len, -1, self.v_head_dim)
+            .transpose(1, 2)
+        )
+
+        q = apply_rope_matmul(q, selected_freqs)
+        k = apply_rope_matmul(k, selected_freqs)
+
+        key_cache, key_scale_cache, value_cache, _k_fp8, _k_scale = (
+            fp8_kv_cache_update(
+                k, v, key_cache, key_scale_cache, value_cache, cache_index
+            )
+        )
+        return q, key_cache, key_scale_cache, value_cache
+
+    def attn_core(self, q, key_cache, key_scale_cache, value_cache, attn_mask):
+        from hf_adapters.fp8_kv_cache import fp8_attn_core
+
+        bsz, _, seq_len, _ = q.shape
+        compute_dtype = q.dtype
+        attn_out = fp8_attn_core(
+            q, key_cache, key_scale_cache, value_cache,
+            attn_mask, self.scaling, compute_dtype,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        return self.o_proj(attn_out)
+
+    def forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        cache_index,
+    ):
+        q, key_cache, key_scale_cache, value_cache = self.pre_attn(
+            hidden_states, selected_freqs,
+            key_cache, key_scale_cache, value_cache, cache_index,
+        )
+        attn_out = self.attn_core(q, key_cache, key_scale_cache, value_cache, attn_mask)
+        return attn_out, key_cache, key_scale_cache, value_cache
+
+
+class Fp8KVStandardGQABlock(nn.Module):
+    """``StandardGQABlock`` variant wired to ``Fp8KVStandardGQAAttention``.
+
+    The block signature gains one extra cache tensor: the key scale cache.
+    ``forward`` threads it through untouched between the two compiled regions.
+    """
+
+    def __init__(self, layer, is_res_mul: bool | None = None):
+        super().__init__()
+        self.self_attn = Fp8KVStandardGQAAttention(layer.self_attn)
+        self.mlp = layer.mlp
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.residual_multiplier = layer.residual_multiplier if is_res_mul else None
+        self.train(layer.training)
+        self._pre_attn = torch.compile(self._region_pre_attn, dynamic=False)
+        self._attention_tail = torch.compile(self._region_attention_tail, dynamic=False)
+
+    def _region_pre_attn(
+        self,
+        hidden_states,
+        selected_freqs,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        cache_index,
+    ):
+        h = self.input_layernorm(hidden_states)
+        return self.self_attn.pre_attn(
+            h, selected_freqs, key_cache, key_scale_cache, value_cache, cache_index
+        )
+
+    def _region_attention_tail(
+        self, hidden_states, q, key_cache, key_scale_cache, value_cache, attn_mask
+    ):
+        attn_out = self.self_attn.attn_core(
+            q, key_cache, key_scale_cache, value_cache, attn_mask
+        )
+
+        if self.residual_multiplier is None:
+            h = hidden_states + attn_out
+        else:
+            h = hidden_states + attn_out * self.residual_multiplier
+
+        residual = h
+        h = self.post_attention_layernorm(h)
+        h = self.mlp(h)
+        if self.residual_multiplier is None:
+            h = residual + h
+        else:
+            h = residual + h * self.residual_multiplier
+        return h
+
+    def forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        cache_index,
+    ):
+        q, key_cache, key_scale_cache, value_cache = self._pre_attn(
+            hidden_states, selected_freqs,
+            key_cache, key_scale_cache, value_cache, cache_index,
+        )
+        with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
+            h = self._attention_tail(
+                hidden_states, q, key_cache, key_scale_cache, value_cache, attn_mask
+            )
+        return h, key_cache, key_scale_cache, value_cache
+
+
+def prepare_standard_gqa_blocks_fp8_kv(layers, is_res_mul: bool | None = None):
+    """Like ``prepare_standard_gqa_blocks`` but uses ``Fp8KVStandardGQABlock``.
+
+    Replaces all decoder layers in-place with FP8 KV cache variants and
+    returns the block list.  Call this instead of ``prepare_standard_gqa_blocks``
+    in adapters that enable FP8 KV cache.
+    """
+    blocks = []
+    for i, layer in enumerate(list(layers)):
+        block = Fp8KVStandardGQABlock(layer, is_res_mul)
+        layers[i] = block
+        blocks.append(block)
+    return blocks
+
 
 
 def make_decoder_block(

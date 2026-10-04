@@ -270,9 +270,12 @@ def fp8_status(model: nn.Module) -> dict:
         "orientation_ok": True,
     }
     for _, m in model.named_modules():
-        if isinstance(m, FP8Linear):
+        # Use type name check to avoid class identity mismatch when FP8Linear
+        # is imported from a different PYTHONPATH entry than the model was built with.
+        is_fp8 = type(m).__name__ == "FP8Linear"
+        if is_fp8:
             status["n_fp8"] += 1
-            status["n_prequantized"] += int(m.prequantized)
+            status["n_prequantized"] += int(getattr(m, "prequantized", False))
             status["n_weight_fp8"] += int(m.weight.dtype == FP8_DTYPE)
             if tuple(m.weight.shape) != (m.in_features, m.out_features):
                 status["orientation_ok"] = False

@@ -39,6 +39,7 @@ from hf_adapters.hf_common import (
     pad_lm_head,
     prepare_rope_and_heads,
     prepare_standard_gqa_blocks,
+    prepare_standard_gqa_blocks_fp8_kv,
     text_config,
 )
 
@@ -51,23 +52,42 @@ def _run_backbone_forward(
     key_caches,
     value_caches,
     cache_index,
+    key_scale_caches=None,
 ):
-    """Granite 3.3 backbone: embedding * multiplier, blocks, norm."""
+    """Granite 3.3 backbone: embedding * multiplier, blocks, norm.
+
+    When ``key_scale_caches`` is provided (FP8 KV cache mode), each compiled
+    block receives the extra per-token K scale cache and returns it updated.
+    """
     backbone = get_backbone(model)
     h = backbone.embed_tokens(input_ids)
     h = h * backbone.embedding_multiplier
 
     selected_freqs = model._spyre_rope(h, position_ids)
 
-    for i, compiled_block in enumerate(model._spyre_compiled_blocks):
-        h, key_caches[i], value_caches[i] = compiled_block(
-            h,
-            selected_freqs,
-            attn_mask,
-            key_caches[i],
-            value_caches[i],
-            cache_index,
-        )
+    if key_scale_caches is None:
+        # Standard BF16/FP16 KV cache path
+        for i, compiled_block in enumerate(model._spyre_compiled_blocks):
+            h, key_caches[i], value_caches[i] = compiled_block(
+                h,
+                selected_freqs,
+                attn_mask,
+                key_caches[i],
+                value_caches[i],
+                cache_index,
+            )
+    else:
+        # FP8 KV cache path — block signature carries key_scale_cache
+        for i, compiled_block in enumerate(model._spyre_compiled_blocks):
+            h, key_caches[i], key_scale_caches[i], value_caches[i] = compiled_block(
+                h,
+                selected_freqs,
+                attn_mask,
+                key_caches[i],
+                key_scale_caches[i],
+                value_caches[i],
+                cache_index,
+            )
 
     h = model._spyre_compiled_norm(h)
     return h
@@ -81,6 +101,7 @@ def _run_forward(
     key_caches,
     value_caches,
     cache_index,
+    key_scale_caches=None,
 ):
     """Granite 3.3 causal-LM forward: backbone + head / scaling."""
     h = _run_backbone_forward(
@@ -91,6 +112,7 @@ def _run_forward(
         key_caches,
         value_caches,
         cache_index,
+        key_scale_caches=key_scale_caches,
     )
     logits = model.lm_head(h)
     return logits / text_config(model.config).logits_scaling
@@ -103,8 +125,15 @@ def _fp16_rmsnorm_forward(self, h):
     return self.weight * (h * torch.rsqrt(variance + self.variance_epsilon))
 
 
-def prepare_for_spyre(model):
-    """Apply Spyre adaptations to Granite 3.3 model in-place."""
+def prepare_for_spyre(model, fp8_kv_cache: bool = False):
+    """Apply Spyre adaptations to Granite 3.3 model in-place.
+
+    Args:
+        fp8_kv_cache: When ``True``, use FP8 KV cache — K is stored as E4M3
+            and QK^T is computed in FP8 via ``spyre.scaled_mm``.  V remains
+            in the compute dtype.  Requires the model to already be prepared
+            with FP8 weight loading (``swap_linears_to_fp8(direct_load=True)``).
+    """
     backbone = get_backbone(model)
     # FP8 checkpoints only; runs before the blocks are built so they close over
     # FP8Linear.  direct_load=True keeps E4M3 weights as-is (prequantized=True)
@@ -126,6 +155,14 @@ def prepare_for_spyre(model):
                 norm.forward = types.MethodType(_fp16_rmsnorm_forward, norm)
     prepare_rope_and_heads(model)
     pad_lm_head(model)
-    model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
+    if fp8_kv_cache:
+        model._spyre_compiled_blocks = prepare_standard_gqa_blocks_fp8_kv(
+            backbone.layers, True
+        )
+        model._spyre_fp8_kv_cache = True
+        print(f"FP8 KV cache: enabled (K stored as E4M3, QK^T in FP8)")
+    else:
+        model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
+        model._spyre_fp8_kv_cache = False
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
     model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
