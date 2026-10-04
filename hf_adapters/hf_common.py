@@ -2254,8 +2254,19 @@ def generate(
     #
     # Results are written to ``model._spyre_kv_stats`` exactly once: the first
     # call (warmup) sets it and subsequent calls leave it unchanged.  This ensures
-    # the snapshot is always taken against a clean post-load, pre-execution
-    # baseline rather than mid-inference state.
+    # the snapshot is taken against a clean post-load, pre-execution baseline.
+    #
+    # In this adapter (SpyreAdapter) warmup and inference use *identical* input
+    # shapes (both padded to MAX_INPUT_TOKENS with the same max_new_tokens), so
+    # ``generation_cache_len`` produces the same ``max_cache_len`` every call and
+    # the allocated bytes for KV are the same.  ``kv_logical_total_mb`` and
+    # ``kv_alloc_delta_mb`` are therefore correct for inference.
+    #
+    # ``kv_reserved_delta_mb`` intentionally reflects the cold-allocator cost
+    # (first call): the allocator must claim fresh pages from the driver on the
+    # first allocation.  On subsequent calls the allocator reuses freed blocks and
+    # the reserved delta would be near zero, which would misrepresent the true
+    # device-memory claim of the cache.
     _spyre_mem = None
     try:
         _spyre_mem = getattr(torch, "spyre", None) and getattr(torch.spyre, "memory", None)
