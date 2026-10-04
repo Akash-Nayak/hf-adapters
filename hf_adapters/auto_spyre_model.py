@@ -368,6 +368,7 @@ class AutoSpyreModel:
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
         trust_remote_code: bool | None = None,
+        fp8_kv_cache: bool = False,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
             model_name_or_path=model_name_or_path,
@@ -388,7 +389,7 @@ class AutoSpyreModel:
             tp_plan=tp_plan,
             trust_remote_code=trust_remote_code,
         )
-        move_model_to_spyre(model, module, dtype)
+        move_model_to_spyre(model, module, dtype, fp8_kv_cache=fp8_kv_cache)
         return model
 
 
@@ -408,6 +409,7 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
         dtype: torch.dtype | None = None,
         tp_plan: Optional[Union[dict, str]] = None,
         trust_remote_code: bool | None = None,
+        fp8_kv_cache: bool = False,
     ) -> PreTrainedModel:
         module: ModuleType = resolve_adapter_module(
             model_name_or_path, trust_remote_code=trust_remote_code
@@ -422,6 +424,7 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
             dtype=dtype,
             tp_plan=tp_plan,
             trust_remote_code=trust_remote_code,
+            fp8_kv_cache=fp8_kv_cache,
         )
 
         def model_generate(

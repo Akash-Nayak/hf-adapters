@@ -1709,11 +1709,17 @@ def load_model_common(
     return model
 
 
-def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
+def move_model_to_spyre(model, module, dtype: torch.dtype, fp8_kv_cache: bool = False) -> None:
     from hf_adapters.fp8_linear import FP8Linear, prequantize_fp8_weights
 
     untie_embedding_and_lm_head(model)
-    module.prepare_for_spyre(model)
+    # Pass fp8_kv_cache only when the adapter's prepare_for_spyre accepts it
+    # (hf_granite does; other adapters use the no-kwarg signature).
+    import inspect as _inspect
+    if "fp8_kv_cache" in _inspect.signature(module.prepare_for_spyre).parameters:
+        module.prepare_for_spyre(model, fp8_kv_cache=fp8_kv_cache)
+    else:
+        module.prepare_for_spyre(model)
     _move_to_spyre_with_layout(model, dtype)
     for submod_name in getattr(model, "_spyre_cpu_submodules", []):
         model.get_submodule(submod_name).to("cpu")
@@ -2235,6 +2241,37 @@ def generate(
     # Match KV cache and mask dtype to the model's weight dtype.
     model_d_type = get_model_dtype(model)
     use_fp8_kv = getattr(model, "_spyre_fp8_kv_cache", False)
+
+    # ── KV cache allocation ──────────────────────────────────────────────────
+    # Snapshot *both* allocated and reserved memory immediately before and after
+    # the KV-cache allocation so callers can compute exact device-memory deltas
+    # independently of weights and activation working sets.
+    #
+    # ``memory_allocated()``  — bytes held by live tensors (never shrinks on free
+    #                           unless the allocator flushes its cache).
+    # ``memory_reserved()``   — bytes the caching allocator has claimed from the
+    #                           device driver (allocated + retained free blocks).
+    #
+    # Results are written to ``model._spyre_kv_stats`` exactly once: the first
+    # call (warmup) sets it and subsequent calls leave it unchanged.  This ensures
+    # the snapshot is always taken against a clean post-load, pre-execution
+    # baseline rather than mid-inference state.
+    _spyre_mem = None
+    try:
+        _spyre_mem = getattr(torch, "spyre", None) and getattr(torch.spyre, "memory", None)
+    except Exception:
+        pass
+
+    _write_kv_stats = not hasattr(model, "_spyre_kv_stats")
+    if _write_kv_stats and _spyre_mem:
+        try:
+            kv_alloc_before_b    = _spyre_mem.memory_allocated()
+            kv_reserved_before_b = _spyre_mem.memory_reserved()
+        except Exception:
+            kv_alloc_before_b = kv_reserved_before_b = None
+    else:
+        kv_alloc_before_b = kv_reserved_before_b = None
+
     if use_fp8_kv:
         key_caches, key_scale_caches, value_caches = allocate_fp8_kv_caches(
             model, batch_size, max_cache_len, model_d_type
@@ -2244,6 +2281,68 @@ def generate(
             model, batch_size, max_cache_len, model_d_type
         )
         key_scale_caches = None
+
+    if _write_kv_stats and _spyre_mem:
+        try:
+            kv_alloc_after_b    = _spyre_mem.memory_allocated()
+            kv_reserved_after_b = _spyre_mem.memory_reserved()
+        except Exception:
+            kv_alloc_after_b = kv_reserved_after_b = None
+    else:
+        kv_alloc_after_b = kv_reserved_after_b = None
+
+    if _write_kv_stats:
+        # Logical KV byte counts from tensor shapes (dtype-aware, device-layout-agnostic).
+        # FP8 KV:  key (FP8, 1 B/elem)  + key_scale (DL16, 2 B/elem) + value (DL16, 2 B/elem)
+        # DL16 KV: key (DL16, 2 B/elem) + value (DL16, 2 B/elem)
+        def _logical_bytes(t):
+            esz = {
+                torch.float8_e4m3fn: 1,
+                torch.float16: 2,
+                torch.bfloat16: 2,
+                torch.float32: 4,
+            }.get(t.dtype, t.element_size())
+            return t.numel() * esz
+
+        shapes = kv_cache_shapes(model)
+        kv_num_layers = len(shapes)
+        if use_fp8_kv:
+            kv_bytes_per_layer = [
+                _logical_bytes(key_caches[i])
+                + _logical_bytes(key_scale_caches[i])
+                + _logical_bytes(value_caches[i])
+                for i in range(kv_num_layers)
+            ]
+        else:
+            kv_bytes_per_layer = [
+                _logical_bytes(key_caches[i]) + _logical_bytes(value_caches[i])
+                for i in range(kv_num_layers)
+            ]
+        kv_logical_total_mb = round(sum(kv_bytes_per_layer) / 1e6, 2)
+
+        def _mb(b):
+            return round(b / 1e6, 1) if b is not None else None
+
+        def _delta_mb(after, before):
+            if after is not None and before is not None:
+                return round((after - before) / 1e6, 1)
+            return None
+
+        model._spyre_kv_stats = {
+            # Logical (dtype-derived) sizing — independent of device layout padding.
+            "kv_num_layers":       kv_num_layers,
+            "kv_bytes_per_layer":  kv_bytes_per_layer,
+            "kv_logical_total_mb": kv_logical_total_mb,
+            # Allocator-measured delta across only the KV allocation calls.
+            # allocated = live tensors; reserved = live + allocator-retained free blocks.
+            "kv_alloc_before_mb":    _mb(kv_alloc_before_b),
+            "kv_alloc_after_mb":     _mb(kv_alloc_after_b),
+            "kv_alloc_delta_mb":     _delta_mb(kv_alloc_after_b, kv_alloc_before_b),
+            "kv_reserved_before_mb": _mb(kv_reserved_before_b),
+            "kv_reserved_after_mb":  _mb(kv_reserved_after_b),
+            "kv_reserved_delta_mb":  _delta_mb(kv_reserved_after_b, kv_reserved_before_b),
+        }
+    # ── end KV instrumentation ───────────────────────────────────────────────
 
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
