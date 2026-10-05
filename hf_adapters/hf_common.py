@@ -1317,6 +1317,62 @@ def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
     ]
 
 
+def _scale_cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, dtype):
+    """Device layout for a 3D ``[B, n_kv, L]`` scale cache with ``L`` OUTERMOST on device.
+
+    The key scale cache stores one scalar BF16/FP16 value per token per KV head.
+    Its logical shape is 3D ``[B, n_kv, L]`` — no ``head_dim`` axis.  The Spyre
+    scheduler requires the indexed dimension (``L``, dim 2 of the logical tensor)
+    to sit at *device* position 0.
+
+    On Spyre a DL16 stick holds 64 elements.  For a 3D scalar tensor the "stick"
+    holds 64 scalars, so ``eps=64`` and ``sticks=1`` (one stick per token row).
+
+    Device layout: ``[L, n_kv, sticks=1, B, eps=64]``
+    stride_map (logical strides in row-major ``[B, n_kv, L]``):
+        - L dim  → logical stride 1  (innermost in the 3D row-major layout)
+        - n_kv   → logical stride L
+        - sticks → logical stride 1  (within a stick, elements are contiguous)
+        - B      → logical stride n_kv * L
+        - eps    → logical stride 1  (within-stick element offset)
+
+    Returns ``None`` when torch-spyre is unavailable (CPU runs).
+    """
+    try:
+        torch.empty(1, device=DEVICE)
+        from torch_spyre._C import (  # type: ignore[import-not-found]
+            SpyreTensorLayout,
+            get_device_dtype,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    # For a 3D [B, n_kv, L] tensor the "head_dim" is 1 scalar.
+    # DL16 stick = 64 elements; with head_dim=1 we need 64 scalars per stick,
+    # but each token IS one scalar, so we pack 64 tokens per stick.
+    # Use head_dim=1 probe to get eps from SpyreTensorLayout.
+    shape_probe = [batch_size, num_kv_heads, max_cache_len, 1]
+    eps = SpyreTensorLayout(shape_probe, dtype).elems_per_stick()
+    # eps == 64 for DL16 (stick holds 64 elements).
+    # sticks = ceil(1 / eps) = 1
+    sticks = 1
+    device_size = [max_cache_len, num_kv_heads, sticks, batch_size, eps]
+    # Logical tensor is [B, n_kv, L] row-major; strides: L→1, n_kv→L, B→n_kv*L
+    stride_map = [
+        1,                           # L: logical stride 1
+        max_cache_len,               # n_kv: logical stride L
+        eps,                         # stick count: eps elements per stick
+        num_kv_heads * max_cache_len,  # B: logical stride n_kv * L
+        1,                           # eps (within-stick offset)
+    ]
+    device_dtype = get_device_dtype(dtype)
+    return SpyreTensorLayout(
+        device_size=device_size,
+        stride_map=stride_map,
+        device_dtype=device_dtype,
+    )
+
+
 def _cache_position_first_stl(
     batch_size, num_kv_heads, max_cache_len, head_dim, dtype, element_arrangement=None
 ):

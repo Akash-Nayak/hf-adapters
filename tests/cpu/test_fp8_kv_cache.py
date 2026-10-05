@@ -38,6 +38,7 @@ from hf_adapters.fp8_kv_cache import (
     FP8_DTYPE,
     FP8_MAX,
     SCALE_EPS,
+    SCALE_STICK_DIM,
     _quantize_fp8_per_token,
     allocate_fp8_kv_cache_tensors,
     fp8_attn_core,
@@ -96,7 +97,8 @@ class TestQuantizeFp8PerToken:
         B, H, S, D = 2, 4, 8, 64
         x = _bf16(B, H, S, D)
         _, scale = _quantize_fp8_per_token(x)
-        assert scale.shape == (B, H, S), scale.shape  # no trailing 1-dim
+        # scale is [B, H, S, SCALE_STICK_DIM=64] — 4D, broadcast-expanded
+        assert scale.shape == (B, H, S, SCALE_STICK_DIM), scale.shape
 
     def test_scale_is_positive(self):
         x = _bf16(1, 2, 4, 64)
@@ -117,7 +119,8 @@ class TestQuantizeFp8PerToken:
         torch.manual_seed(0)
         x = _bf16(2, 4, 16, 128)
         xq, scale = _quantize_fp8_per_token(x)
-        x_reconstructed = xq.to(torch.bfloat16) * scale.unsqueeze(-1)
+        # scale is [B, H, S, SCALE_STICK_DIM]; use [:1] for [B, H, S, 1] broadcast
+        x_reconstructed = xq.to(torch.bfloat16) * scale[..., :1]
         rel_err = (x - x_reconstructed).abs() / (x.abs() + 1e-6)
         assert rel_err.mean().item() < 0.025, f"mean rel_err={rel_err.mean():.4f}"
 
@@ -139,7 +142,7 @@ class TestFp8KvCacheUpdate:
         k = _bf16(B, n_kv, n, D)
         v = _bf16(B, n_kv, n, D)
         key_cache = torch.zeros(B, n_kv, L, D, dtype=FP8_DTYPE)
-        key_scale_cache = torch.zeros(B, n_kv, L, dtype=dtype)  # [B, n_kv, L] — 3D scalar
+        key_scale_cache = torch.zeros(B, n_kv, L, SCALE_STICK_DIM, dtype=dtype)
         value_cache = torch.zeros(B, n_kv, L, D, dtype=dtype)
         idx = torch.arange(0, n, dtype=torch.long)
         return k, v, key_cache, key_scale_cache, value_cache, idx
@@ -188,7 +191,7 @@ class TestFp8KvCacheUpdate:
         """Cache must hold values from multiple successive decode steps."""
         B, n_kv, D, L = 1, 2, 32, 64
         kc = torch.zeros(B, n_kv, L, D, dtype=FP8_DTYPE)
-        ksc = torch.zeros(B, n_kv, L, dtype=torch.bfloat16)
+        ksc = torch.zeros(B, n_kv, L, SCALE_STICK_DIM, dtype=torch.bfloat16)
         vc = torch.zeros(B, n_kv, L, D, dtype=torch.bfloat16)
 
         written_v = []
@@ -223,7 +226,7 @@ class TestFp8AttnCoreAccuracy:
         """Build key_cache / key_scale_cache / value_cache from random BF16 K/V."""
         fill_len = fill_len or L
         kc = torch.zeros(B, n_kv, L, D, dtype=FP8_DTYPE)
-        ksc = torch.zeros(B, n_kv, L, dtype=dtype)
+        ksc = torch.zeros(B, n_kv, L, SCALE_STICK_DIM, dtype=dtype)
         vc = torch.zeros(B, n_kv, L, D, dtype=dtype)
         k = _bf16(B, n_kv, fill_len, D)
         v = _bf16(B, n_kv, fill_len, D)
@@ -312,7 +315,7 @@ class TestFp8AttnCoreAccuracy:
 
         # Build empty caches
         kc = torch.zeros(B, n_kv, max_cache_len, D, dtype=FP8_DTYPE)
-        ksc = torch.zeros(B, n_kv, max_cache_len, dtype=dtype)
+        ksc = torch.zeros(B, n_kv, max_cache_len, SCALE_STICK_DIM, dtype=dtype)
         vc = torch.zeros(B, n_kv, max_cache_len, D, dtype=dtype)
 
         # Prefill
@@ -351,7 +354,7 @@ class TestAllocationHelpers:
         B, n_kv, L, D = 2, 8, 128, 64
         kc, ksc, vc = allocate_fp8_kv_cache_tensors(B, n_kv, L, D, torch.bfloat16, device="cpu")
         assert kc.shape == (B, n_kv, L, D)
-        assert ksc.shape == (B, n_kv, L)       # [B, n_kv, L] — 3D scalar scale
+        assert ksc.shape == (B, n_kv, L, SCALE_STICK_DIM)  # [B, n_kv, L, 64]
         assert vc.shape == (B, n_kv, L, D)
 
     def test_allocate_fp8_kv_cache_tensors_dtypes(self):

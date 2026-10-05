@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 from hf_adapters.fp8_kv_cache import (
     FP8_DTYPE,
+    SCALE_STICK_DIM,
     allocate_fp8_kv_cache_tensors,
     fp8_attn_core,
     fp8_kv_cache_update,
@@ -124,7 +125,7 @@ def test_fp8_key_cache_layout_on_spyre():
 
     # shape
     assert kc.shape  == (B, N_KV, MAX_CACHE_LEN, HEAD_DIM)
-    assert ksc.shape == (B, N_KV, MAX_CACHE_LEN)              # [B, n_kv, L] — 3D scalar scale
+    assert ksc.shape == (B, N_KV, MAX_CACHE_LEN, SCALE_STICK_DIM)  # [B, n_kv, L, 64]
     assert vc.shape  == (B, N_KV, MAX_CACHE_LEN, HEAD_DIM)
 
     # FP8 stick = 128 elements
@@ -190,8 +191,8 @@ def test_fp8_kv_cache_update_compiled(dtype):
     vc_written = vc_out[:, :, :PREFILL_LEN, :].to("cpu")
     torch.testing.assert_close(vc_written, v.to("cpu"), rtol=0, atol=0)
 
-    # Scale cache must be positive at written positions ([B, n_kv, L] — 3D)
-    ksc_written = ksc_out[:, :, :PREFILL_LEN].to("cpu")
+    # Scale cache must be positive at written positions ([B, n_kv, L, 64])
+    ksc_written = ksc_out[:, :, :PREFILL_LEN, :].to("cpu")
     assert (ksc_written > 0).all(), "key scale cache has non-positive values"
 
 
