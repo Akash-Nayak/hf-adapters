@@ -114,11 +114,13 @@ def fp8_kv_cache_update(
         k: ``[B, n_kv, n, head_dim]`` — K projection for ``n`` positions.
         v: ``[B, n_kv, n, head_dim]`` — V projection for ``n`` positions.
         key_cache: ``[B, n_kv, L, head_dim]`` FP8 E4M3.
-        key_scale_cache: ``[B, n_kv, L, head_dim]`` compute dtype — per-token K
-            scale broadcast across head_dim.  Storing the full head_dim avoids
-            any size-1 trailing dimension which triggers the Spyre inductor
-            ``ranges_from_index_vars`` scheduler crash.  The extra memory is
-            negligible (head_dim BF16 values per token).
+        key_scale_cache: ``[B, n_kv, L]`` compute dtype — one scalar scale per
+            token per KV head.  3D shape (no trailing size-1 dim) is required:
+            a size-1 trailing dim on the scatter destination causes the Spyre
+            inductor ``ranges_from_index_vars`` scheduler crash
+            (``d1=absent`` / ``index_vars=[[c0],[]]``).  The unsqueeze(-1) for
+            broadcasting is deferred to ``fp8_attn_core`` at read time where it
+            does not appear in any scatter graph.
         value_cache: ``[B, n_kv, L, head_dim]`` compute dtype.
         cache_index: ``[n]`` int64 destination positions.
 
@@ -135,12 +137,10 @@ def fp8_kv_cache_update(
         key_cache.view(torch.uint8).index_copy_(2, cache_index, k_fp8.view(torch.uint8))
     else:
         key_cache.index_copy_(2, cache_index, k_fp8)
-    # Expand scale to [B, n_kv, n, head_dim] so the scatter writes a full
-    # DL16 row — same shape as key_cache / value_cache.  This avoids any
-    # size-1 last dimension that would crash the Spyre inductor scheduler.
-    head_dim = k.shape[-1]
-    k_scale_exp = k_scale.unsqueeze(-1).expand(*k_scale.shape, head_dim)
-    key_scale_cache.index_copy_(2, cache_index, k_scale_exp)
+    # k_scale is [B, n_kv, n] — scatter directly into the 3D scale cache.
+    # No expand/unsqueeze: the 3D index_copy_ writes exactly one scalar per
+    # token position, which is what the 3D key_scale_cache expects.
+    key_scale_cache.index_copy_(2, cache_index, k_scale)
     value_cache.index_copy_(2, cache_index, v)
 
     return key_cache, key_scale_cache, value_cache, k_fp8, k_scale
@@ -168,8 +168,10 @@ def fp8_attn_core(
     Args:
         q: ``[B, H, S, D]`` query in compute dtype (DL16).
         key_cache: ``[B, n_kv, L, D]`` FP8 E4M3 key cache.
-        key_scale_cache: ``[B, n_kv, L, D]`` per-token K scale, broadcast across
-            head_dim — same shape as key_cache.
+        key_scale_cache: ``[B, n_kv, L]`` per-token K scale — one scalar per
+            token per KV head.  Unsqueeze(-1) is applied here at read time for
+            broadcasting against ``[B, n_kv, L, D]`` without appearing in any
+            scatter graph.
         value_cache: ``[B, n_kv, L, D]`` compute dtype value cache.
         attn_mask: additive causal mask or None.
         scaling: attention scale (``1 / sqrt(head_dim)``).
@@ -191,7 +193,11 @@ def fp8_attn_core(
     # Casting to torch.float16 first ensures on-device fp8todl16 executes without
     # falling back to CPU (which would happen if converting FP8 directly to BF16).
     # Then cast the dequantized result to compute_dtype (BF16 or FP16).
-    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache.to(torch.float16)).to(
+    #
+    # key_scale_cache is [B, n_kv, L] — unsqueeze(-1) for [B, n_kv, L, 1]
+    # broadcast against key_cache [B, n_kv, L, D].  This unsqueeze is safe here
+    # (read path only, not inside a scatter graph).
+    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache.unsqueeze(-1).to(torch.float16)).to(
         compute_dtype
     )
     k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
@@ -242,14 +248,17 @@ def allocate_fp8_kv_cache_tensors(
     Allocating with ``QFP8CH`` ensures the scatter write and the fp8todl16 read
     use the same element ordering.
 
-    ``key_scale_cache`` is allocated as a ``[B, n_kv, L, head_dim]`` DL16 tensor
-    via ``allocate_kv_cache_tensor`` (scatter-ready position-first layout on Spyre).
-    The scale is stored broadcast-expanded across ``head_dim`` so the scatter writes
-    a full DL16 row — exactly the same shape as ``value_cache``.  This sidesteps the
-    Spyre inductor ``ranges_from_index_vars`` crash that occurs for any tensor with
-    a size-1 or absent trailing dimension in a compiled scatter.
+    ``key_scale_cache`` is allocated as a **3D** ``[B, n_kv, L]`` DL16 tensor —
+    one scalar scale per token per KV head.  This is 128× smaller than the
+    previous ``[B, n_kv, L, head_dim]`` form (which broadcast the scalar across
+    ``head_dim`` to avoid size-1 trailing dims).  The 3D shape is scatter-safe:
+    ``index_copy_`` on dim 2 of a 3D tensor matches the 3D source
+    ``k_scale [B, n_kv, n]`` from ``_quantize_fp8_per_token`` exactly — no size-1
+    trailing dim, no ``ranges_from_index_vars`` crash.  The ``unsqueeze(-1)`` for
+    broadcasting against ``[B, n_kv, L, D]`` happens at read time in
+    ``fp8_attn_core``, not in the scatter graph.
 
-    ``value_cache`` uses the same scatter-ready DL16 allocation.
+    ``value_cache`` uses the standard scatter-ready 4D DL16 allocation.
     """
     if device is None:
         from hf_adapters.hf_common import DEVICE
@@ -296,14 +305,15 @@ def allocate_fp8_kv_cache_tensors(
         # (bit pattern of FP8 zero == uint8 zero).
         key_cache.view(torch.uint8).zero_()
 
-    # key_scale_cache: scatter-ready DL16 allocation, [B, n_kv, L, head_dim].
-    # Using the same allocate_kv_cache_tensor path as value_cache gives the
-    # position-first SpyreTensorLayout on Spyre (scatter-safe) with a full
-    # head_dim DL16 row — no size-1 dims, no scheduler crash.
+    # key_scale_cache: 3D [B, n_kv, L] — one scalar per token per KV head.
+    # Allocated with a scatter-ready position-first layout on Spyre.
+    # _cache_position_first_stl is called with head_dim=1 to get a 3D-equivalent
+    # layout where L sits at device position 0.  On CPU a plain zeros tensor is
+    # returned (stl=None path below).
     from hf_adapters.hf_common import allocate_kv_cache_tensor
     key_scale_cache = allocate_kv_cache_tensor(
-        batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
-    )
+        batch_size, num_kv_heads, max_cache_len, 1, compute_dtype, device
+    ).squeeze(-1)  # [B, n_kv, L, 1] → [B, n_kv, L]
     value_cache = allocate_kv_cache_tensor(
         batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
     )

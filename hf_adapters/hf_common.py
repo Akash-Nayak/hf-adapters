@@ -1463,10 +1463,12 @@ def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None)
     Returns ``(key_caches, key_scale_caches, value_caches)`` where:
 
     * ``key_caches[i]``       — ``[B, n_kv, L, head_dim]`` ``float8_e4m3fn``
-    * ``key_scale_caches[i]`` — ``[B, n_kv, L, head_dim]`` ``dtype`` (per-token K scale, broadcast across head_dim)
+    * ``key_scale_caches[i]`` — ``[B, n_kv, L]`` ``dtype`` (one scalar per token per KV head)
     * ``value_caches[i]``     — ``[B, n_kv, L, head_dim]`` ``dtype``
 
     ``dtype`` is the compute dtype (BF16 or FP16) used for activations and V.
+    The scale cache is 3D (no trailing size-1 dim) to avoid the Spyre inductor
+    ``ranges_from_index_vars`` crash in compiled scatter graphs.
     """
     from hf_adapters.fp8_kv_cache import allocate_fp8_kv_cache_tensors
 
@@ -2304,7 +2306,9 @@ def generate(
 
     if _write_kv_stats:
         # Logical KV byte counts from tensor shapes (dtype-aware, device-layout-agnostic).
-        # FP8 KV:  key (FP8, 1 B/elem)  + key_scale (DL16, 2 B/elem) + value (DL16, 2 B/elem)
+        # FP8 KV:  key (FP8, 1 B/elem, [B,n_kv,L,D])
+        #        + key_scale (DL16, 2 B/elem, [B,n_kv,L] — 3D, 128× smaller than before)
+        #        + value (DL16, 2 B/elem, [B,n_kv,L,D])
         # DL16 KV: key (DL16, 2 B/elem) + value (DL16, 2 B/elem)
         def _logical_bytes(t):
             esz = {
