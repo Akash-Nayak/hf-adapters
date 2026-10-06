@@ -18,16 +18,27 @@ Storage strategy:
 
   1. K projection output is DL16.  Compute a per-token scale for K and store
      K as FP8 E4M3 in the cache; also store the per-token K scale alongside
-     the quantized K tensor.  V is stored unchanged in compute dtype.
+     the quantized K tensor as a compact **3D** ``[B, n_kv, L]`` tensor (one
+     scalar per token per KV head).  V is stored unchanged in compute dtype.
 
   2. At attention time (Option 2 — active):
      Dequantize K from FP8 to DL16 (``k_fp8 * k_scale``), then run
      QK^T via ``torch.matmul`` (DL16 × DL16 → DL16).
 
   Option 1 (FP8 QK^T via ``spyre.scaled_mm``) is preserved in code but
-  commented out — it is blocked by ``ReStickifyOpHBM on SEN143_FP8`` in the
-  compiler (``spyre_kernel.py``).  Switching to Option 1 is a single swap in
-  ``fp8_attn_core`` once that blocker is resolved.
+  commented out — it is blocked by a deeptools DDC constraint
+  (``ddl_conversion.cpp:2539 DtException``) for the fused
+  ``quantize_fp8_with_scale + scaled_mm`` 3D SDSC shapes.  Blocker 1
+  (``ReStickifyOpHBM``) and Blocker 2 (``superdsc.py out_reuse_dim``) are
+  both resolved.
+
+Scale cache memory:
+  Old workaround: ``[B, n_kv, L, 64]`` — break-even (scale = 1× K size).
+  Current:        ``[B, n_kv, L]``     — ~128× smaller than K; true ~2× K saving.
+  The sub-stick scatter fix (``feat/fp8-paged-attention-substick-scatter``,
+  cherry-picked into ``feat/fp8-kv-cache-opt2``) enables the 3D shape by
+  fixing the ``L3DlOpsScheduler`` "no valid candidate" crash that previously
+  blocked it.
 
 V multiply and softmax always run in DL16 — V is NOT quantized in this
 implementation.  Only K is stored FP8; V remains in the compute dtype.
@@ -44,15 +55,6 @@ import torch.nn.functional as F
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
 SCALE_EPS = 1e-4  # prevents zero scale for all-zero tokens
-# Trailing dimension of key_scale_cache on Spyre.  Must equal one DL16 stick
-# (64 elements) so the 4D cache tensor has a real, non-trivial trailing axis
-# that the Spyre inductor work-division scheduler can map correctly.
-# A 3D [B, n_kv, L] or 4D [B, n_kv, L, 1] cache crashes the deeptools
-# L3DlOpsScheduler ("no valid candidate") because the scatter target lacks a
-# proper stick dimension.  64 is the minimum: one DL16 stick = 64 BF16 elements.
-# At read time only [:,:,:,:1] is used for broadcasting, so the 63 extra
-# elements per token are never read — they are padding for compiler correctness.
-SCALE_STICK_DIM = 64
 
 
 # ---------------------------------------------------------------------------
@@ -68,32 +70,25 @@ def _quantize_fp8_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 
     Returns:
         ``(xq, scale)`` where ``xq`` is FP8 E4M3, same shape as ``x``,
-        and ``scale`` is ``[..., S, SCALE_STICK_DIM]`` — broadcast-expanded
-        across ``SCALE_STICK_DIM=64`` to match the 4D key_scale_cache layout.
-        The 64-element trailing axis satisfies the Spyre work-division scheduler:
-        a 3D or size-1-trailing-dim tensor triggers the deeptools
-        L3DlOpsScheduler "no valid candidate" error.
+        and ``scale`` is ``[..., S, 1]`` — one scalar per token, kept as a
+        size-1 trailing dim for broadcasting against ``[..., S, D]``.
+        The 3D key_scale_cache stores these scalars compactly as ``[B, n_kv, L]``.
     """
     if x.device.type == "spyre":
-        # Use the same abs().amax() idiom as FP8Linear to avoid the
-        # quantscalepertokenfp8 DDL bug (dbo-opt drops last-dim=1 sticks).
-        # keepdim=True produces [..., S, 1]; expand to SCALE_STICK_DIM=64.
-        scale_4d = (
+        # Use abs().amax() idiom (same as FP8Linear) to avoid the
+        # quantscalepertokenfp8 DDL bug.  keepdim=True → [..., S, 1].
+        scale = (
             (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX))
             .clamp(min=SCALE_EPS)
             .clone()
         )
-        xq = torch.ops.spyre.quantize_fp8_with_scale(x, scale_4d)
-        # Expand the trailing-1 scale to SCALE_STICK_DIM so the scatter
-        # target [B, n_kv, L, SCALE_STICK_DIM] matches the source shape.
-        scale = scale_4d.expand(*scale_4d.shape[:-1], SCALE_STICK_DIM)
+        xq = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
     else:
         # CPU reference path
-        scale_4d = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+        scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
             min=SCALE_EPS
         )
-        xq = (x * scale_4d.reciprocal()).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
-        scale = scale_4d.expand(*scale_4d.shape[:-1], SCALE_STICK_DIM)
+        xq = (x * scale.reciprocal()).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
     return xq, scale
 
 
@@ -120,11 +115,9 @@ def fp8_kv_cache_update(
         k: ``[B, n_kv, n, head_dim]`` — K projection for ``n`` positions.
         v: ``[B, n_kv, n, head_dim]`` — V projection for ``n`` positions.
         key_cache: ``[B, n_kv, L, head_dim]`` FP8 E4M3.
-        key_scale_cache: ``[B, n_kv, L, SCALE_STICK_DIM]`` compute dtype.
-            4D shape with ``SCALE_STICK_DIM=64`` trailing elements (one DL16
-            stick).  The same scalar scale value is replicated 64 times across
-            the trailing dim so the 4D scatter target satisfies the Spyre
-            work-division scheduler and deeptools L3DlOpsScheduler.
+        key_scale_cache: ``[B, n_kv, L]`` compute dtype — one scalar per token
+            per KV head.  The sub-stick scatter fix in ``superdsc.py`` enables
+            this compact 3D shape to compile on Spyre.
         value_cache: ``[B, n_kv, L, head_dim]`` compute dtype.
         cache_index: ``[n]`` int64 destination positions.
 
@@ -133,7 +126,10 @@ def fp8_kv_cache_update(
         quantized ``k_fp8`` that callers need for QK^T (avoids re-quantizing).
     """
     k_fp8, k_scale = _quantize_fp8_per_token(k)
-    # k_fp8: [B, n_kv, n, D], k_scale: [B, n_kv, n, SCALE_STICK_DIM]
+    # k_fp8:  [B, n_kv, n, D]
+    # k_scale: [B, n_kv, n, 1] — squeeze the trailing size-1 dim before scatter
+    #   so the source shape matches the 3D key_scale_cache [B, n_kv, L].
+    k_scale_3d = k_scale.squeeze(-1)  # [B, n_kv, n]
 
     if key_cache.device.type == "cpu":
         # CPU PyTorch does not implement index_copy_ for FP8 dtypes.
@@ -142,11 +138,10 @@ def fp8_kv_cache_update(
         key_cache.view(torch.uint8).index_copy_(2, cache_index, k_fp8.view(torch.uint8))
     else:
         key_cache.index_copy_(2, cache_index, k_fp8)
-    # k_scale is [B, n_kv, n, SCALE_STICK_DIM] — 4D scatter into the 4D
-    # key_scale_cache.  The trailing dim is a real axis (64 elements), not a
-    # size-1 view, so the Spyre inductor work-division scheduler handles it
-    # correctly without any d1=absent / ranges_from_index_vars crash.
-    key_scale_cache.index_copy_(2, cache_index, k_scale)
+    # Scatter the compact 3D scale [B, n_kv, n] into the 3D cache [B, n_kv, L].
+    # The sub-stick indirect scatter fix in superdsc.py (feat/fp8-kv-cache-opt2)
+    # handles this shape correctly on Spyre.
+    key_scale_cache.index_copy_(2, cache_index, k_scale_3d)
     value_cache.index_copy_(2, cache_index, v)
 
     return key_cache, key_scale_cache, value_cache, k_fp8, k_scale
@@ -174,11 +169,9 @@ def fp8_attn_core(
     Args:
         q: ``[B, H, S, D]`` query in compute dtype (DL16).
         key_cache: ``[B, n_kv, L, D]`` FP8 E4M3 key cache.
-        key_scale_cache: ``[B, n_kv, L, SCALE_STICK_DIM]`` per-token K scale.
-            Only ``[:,:,:,:1]`` is meaningful (the remaining 63 elements are
-            broadcast replicas of the same scalar).  Slicing to ``[:,:,:,:1]``
-            gives a ``[B, n_kv, L, 1]`` tensor that broadcasts against
-            ``[B, n_kv, L, D]`` correctly.
+        key_scale_cache: ``[B, n_kv, L]`` per-token K scale (one scalar per
+            token per KV head).  Unsqueeze to ``[B, n_kv, L, 1]`` for
+            broadcasting against ``key_cache [B, n_kv, L, D]``.
         value_cache: ``[B, n_kv, L, D]`` compute dtype value cache.
         attn_mask: additive causal mask or None.
         scaling: attention scale (``1 / sqrt(head_dim)``).
@@ -201,9 +194,9 @@ def fp8_attn_core(
     # falling back to CPU (which would happen if converting FP8 directly to BF16).
     # Then cast the dequantized result to compute_dtype (BF16 or FP16).
     #
-    # key_scale_cache is [B, n_kv, L, SCALE_STICK_DIM=64].  Slice [:,:,:,:1]
-    # for a [B, n_kv, L, 1] scale that broadcasts against key_cache [B,n_kv,L,D].
-    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache[:, :, :, :1].to(torch.float16)).to(
+    # key_scale_cache is [B, n_kv, L] — unsqueeze to [B, n_kv, L, 1] for
+    # broadcasting against key_cache [B, n_kv, L, D].
+    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache.unsqueeze(-1).to(torch.float16)).to(
         compute_dtype
     )
     k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
@@ -254,14 +247,12 @@ def allocate_fp8_kv_cache_tensors(
     Allocating with ``QFP8CH`` ensures the scatter write and the fp8todl16 read
     use the same element ordering.
 
-    ``key_scale_cache`` is allocated as a **4D** ``[B, n_kv, L, SCALE_STICK_DIM]``
-    DL16 tensor where ``SCALE_STICK_DIM=64`` (one DL16 stick).  This is 2× smaller
-    than the original ``[B, n_kv, L, head_dim=128]`` workaround (session 18), but
-    avoids the deeptools ``L3DlOpsScheduler`` "no valid candidate" crash that a 3D
-    or size-1-trailing-dim tensor triggers.  The same scalar scale value is
-    broadcast-expanded across the 64 trailing elements at write time; only
-    ``[:,:,:,:1]`` is read back in ``fp8_attn_core`` for the ``[B,n_kv,L,1]``
-    broadcast against ``key_cache [B,n_kv,L,D]``.
+    ``key_scale_cache`` is allocated as a compact **3D** ``[B, n_kv, L]`` DL16
+    tensor — one scalar per token per KV head.  The sub-stick scatter fix in
+    ``superdsc.py`` (``feat/fp8-paged-attention-substick-scatter``, cherry-picked
+    into ``feat/fp8-kv-cache-opt2``) enables this shape on Spyre by correctly
+    handling the sub-stick ``index_copy_`` for size-1-trailing-dim destinations.
+    Memory cost: ``2 × B × n_kv × L`` bytes — ~128× smaller than K cache.
 
     ``value_cache`` uses the standard scatter-ready 4D DL16 allocation.
     """
@@ -310,14 +301,22 @@ def allocate_fp8_kv_cache_tensors(
         # (bit pattern of FP8 zero == uint8 zero).
         key_cache.view(torch.uint8).zero_()
 
-    from hf_adapters.hf_common import allocate_kv_cache_tensor
-    # key_scale_cache: 4D [B, n_kv, L, SCALE_STICK_DIM=64].
-    # Use the standard position-first STL with head_dim=SCALE_STICK_DIM so L
-    # sits at device position 0 (scatter-ready) and the trailing axis is one
-    # full DL16 stick (64 elements), satisfying the deeptools L3DlOpsScheduler.
-    key_scale_cache = allocate_kv_cache_tensor(
-        batch_size, num_kv_heads, max_cache_len, SCALE_STICK_DIM, compute_dtype, device
-    )
+    from hf_adapters.hf_common import allocate_kv_cache_tensor, _scale_cache_position_first_stl
+    # key_scale_cache: compact 3D [B, n_kv, L] — one scalar per token per KV head.
+    # On Spyre, use _scale_cache_position_first_stl so L sits at device position 0
+    # (scatter-ready).  On CPU, plain zeros (device_layout kwarg unsupported).
+    scale_stl = _scale_cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, compute_dtype) if on_spyre else None
+    if scale_stl is None:
+        key_scale_cache = torch.zeros(
+            (batch_size, num_kv_heads, max_cache_len), dtype=compute_dtype, device=device
+        )
+    else:
+        key_scale_cache = torch.zeros(  # type: ignore[call-overload]
+            (batch_size, num_kv_heads, max_cache_len),
+            dtype=compute_dtype,
+            device=torch.device(device),
+            device_layout=scale_stl,
+        )
     value_cache = allocate_kv_cache_tensor(
         batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
     )
