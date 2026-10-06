@@ -311,12 +311,13 @@ def allocate_fp8_kv_cache_tensors(
             (batch_size, num_kv_heads, max_cache_len), dtype=compute_dtype, device=device
         )
     else:
-        key_scale_cache = torch.zeros(  # type: ignore[call-overload]
+        key_scale_cache = torch.empty(  # type: ignore[call-overload]
             (batch_size, num_kv_heads, max_cache_len),
             dtype=compute_dtype,
             device=torch.device(device),
             device_layout=scale_stl,
         )
+        key_scale_cache.zero_()
     value_cache = allocate_kv_cache_tensor(
         batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
     )
