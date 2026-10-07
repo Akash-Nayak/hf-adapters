@@ -194,9 +194,16 @@ def fp8_attn_core(
     # falling back to CPU (which would happen if converting FP8 directly to BF16).
     # Then cast the dequantized result to compute_dtype (BF16 or FP16).
     #
-    # key_scale_cache is [B, n_kv, L] — unsqueeze to [B, n_kv, L, 1] for
-    # broadcasting against key_cache [B, n_kv, L, D].
-    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache.unsqueeze(-1).to(torch.float16)).to(
+    # key_scale_cache is [B, n_kv, L_scale] — slice to key_cache's L extent
+    # before unsqueezing to [B, n_kv, L, 1] for broadcasting against
+    # key_cache [B, n_kv, L, D].
+    #
+    # Defensive guard: key_scale_cache may have a larger L than key_cache when
+    # SDPA tiling inside the compiled block presents key_cache at a sub-extent
+    # of max_cache_len (e.g. 512 of 1024).  _prefill_cache_inputs in hf_common
+    # aligns the shapes before entering the compiled region, but this slice
+    # ensures correctness even if a caller omits that alignment step.
+    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache[:, :, :L].unsqueeze(-1).to(torch.float16)).to(
         compute_dtype
     )
     k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
