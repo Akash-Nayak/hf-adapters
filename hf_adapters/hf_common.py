@@ -1308,11 +1308,21 @@ def generation_cache_len(prompt_length: int, max_new_tokens: int) -> int:
 
 
 def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
-    """Select cache tensors passed to prefill without wrapping one-shot caches."""
+    """Select cache tensors passed to prefill without wrapping one-shot caches.
+
+    For chunked prefill, slices all caches to ``prefill_kv_len`` on dim 2 so
+    that 4-D key/value caches ``[B, n_kv, L, head_dim]`` and 3-D scale caches
+    ``[B, n_kv, L]`` all have the same L-extent passed into the compiled attention
+    block.  Without this, ``fp8_attn_core`` receives a sliced ``key_cache`` but
+    an un-sliced ``key_scale_cache`` and the ``key_cache * key_scale_cache``
+    broadcast raises a shape mismatch at compile time.
+    """
     if not chunked_prefill:
         return caches
     return [
-        cache[:, :, :prefill_kv_len, :] if cache.ndim == 4 else cache
+        cache[:, :, :prefill_kv_len, :] if cache.ndim == 4
+        else cache[:, :, :prefill_kv_len] if cache.ndim == 3
+        else cache
         for cache in caches
     ]
 
