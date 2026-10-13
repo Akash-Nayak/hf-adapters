@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP8 KV cache for Spyre: K stored as E4M3, QK^T run in DL16 (Option 2).
+"""FP8 KV cache for Spyre: K stored as E4M3, QK^T in FP8 (Option 1).
 
 Storage strategy:
 
@@ -21,16 +21,13 @@ Storage strategy:
      the quantized K tensor as a compact **3D** ``[B, n_kv, L]`` tensor (one
      scalar per token per KV head).  V is stored unchanged in compute dtype.
 
-  2. At attention time (Option 2 — active):
-     Dequantize K from FP8 to DL16 (``k_fp8 * k_scale``), then run
-     QK^T via ``torch.matmul`` (DL16 × DL16 → DL16).
+  2. At attention time (Option 1 — active):
+     Quantize Q to FP8 per-token, run QK^T entirely in FP8 via
+     ``spyre.scaled_bmm`` (FP8 × FP8 → FP16), then apply scale compensation
+     ``scores × q_scale × k_scale × (1/√D)``.  No dequantize step for K.
 
-  Option 1 (FP8 QK^T via ``spyre.scaled_mm``) is preserved in code but
-  commented out — it is blocked by a deeptools DDC constraint
-  (``ddl_conversion.cpp:2539 DtException``) for the fused
-  ``quantize_fp8_with_scale + scaled_mm`` 3D SDSC shapes.  Blocker 1
-  (``ReStickifyOpHBM``) and Blocker 2 (``superdsc.py out_reuse_dim``) are
-  both resolved.
+  Option 2 (dequantize K → DL16, run DL16 QK^T via ``torch.matmul``) is
+  preserved as a fallback below the active block.
 
 Scale cache memory:
   Old workaround: ``[B, n_kv, L, 64]`` — break-even (scale = 1× K size).
@@ -161,17 +158,20 @@ def fp8_attn_core(
     scaling: float,
     compute_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Compute attention with FP8 K cache; QK^T in DL16 (Option 2).
+    """Compute attention with FP8 K cache; QK^T in FP8 (Option 1).
 
-    Dequantizes K from FP8 to DL16 at read time (k_fp8 * k_scale), then runs
-    standard DL16 QK^T matmul, softmax, and AV multiply.
+    Quantizes Q per-token to FP8, runs QK^T entirely in FP8 via
+    ``spyre.scaled_bmm`` (FP8 × FP8 → FP16), applies scale compensation, then
+    runs softmax and AV multiply in compute dtype.  No dequantize step for K.
+
+    On CPU (no ``spyre.scaled_bmm``), falls back to Option 2: dequantize K to
+    DL16 and run DL16 QK^T via ``torch.matmul``.
 
     Args:
         q: ``[B, H, S, D]`` query in compute dtype (DL16).
         key_cache: ``[B, n_kv, L, D]`` FP8 E4M3 key cache.
         key_scale_cache: ``[B, n_kv, L]`` per-token K scale (one scalar per
-            token per KV head).  Unsqueeze to ``[B, n_kv, L, 1]`` for
-            broadcasting against ``key_cache [B, n_kv, L, D]``.
+            token per KV head).
         value_cache: ``[B, n_kv, L, D]`` compute dtype value cache.
         attn_mask: additive causal mask or None.
         scaling: attention scale (``1 / sqrt(head_dim)``).
@@ -186,39 +186,58 @@ def fp8_attn_core(
     # GQA: KV heads are grouped into Q heads.
     kv_repeat = H // n_kv
 
-    # ---------------------------------------------------------------------------
-    # Option 2: Dequantize K from FP8 to DL16 and run DL16 matmul.
-    # ---------------------------------------------------------------------------
-    # On Spyre, FP8 -> FP16 is supported natively by the hardware (fp8todl16).
-    # Casting to torch.float16 first ensures on-device fp8todl16 executes without
-    # falling back to CPU (which would happen if converting FP8 directly to BF16).
-    # Then cast the dequantized result to compute_dtype (BF16 or FP16).
-    #
-    # key_scale_cache is [B, n_kv, L_scale] — slice to key_cache's L extent
-    # before unsqueezing to [B, n_kv, L, 1] for broadcasting against
-    # key_cache [B, n_kv, L, D].
-    #
     # Defensive guard: key_scale_cache may have a larger L than key_cache when
-    # SDPA tiling inside the compiled block presents key_cache at a sub-extent
-    # of max_cache_len (e.g. 512 of 1024).  _prefill_cache_inputs in hf_common
-    # aligns the shapes before entering the compiled region, but this slice
-    # ensures correctness even if a caller omits that alignment step.
-    k_dl16 = (key_cache.to(torch.float16) * key_scale_cache[:, :, :L].unsqueeze(-1).to(torch.float16)).to(
-        compute_dtype
-    )
-    k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
+    # SDPA tiling presents key_cache at a sub-extent of max_cache_len.
+    k_scale = key_scale_cache[:, :, :L]  # [B, n_kv, L]
 
-    logits = torch.matmul(q, k_expanded.transpose(-2, -1)) * scaling
+    on_spyre = q.device.type == "spyre"
 
-    # Apply causal mask (additive, -inf for masked positions)
-    if attn_mask is not None:
-        logits = logits + attn_mask
+    if on_spyre:
+        # -----------------------------------------------------------------
+        # Option 1 (active on Spyre): FP8 QK^T via spyre.scaled_bmm
+        # -----------------------------------------------------------------
+        # Q: quantize per-token to FP8 QFP8CH.
+        # q: [B, H, S, D] → cast to fp16 first (quantize_fp8_with_scale on fp16)
+        q_fp16 = q.to(torch.float16)
+        q_scale = (
+            q_fp16.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)
+        ).clamp(min=SCALE_EPS)  # [B, H, S, 1]
+        q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_fp16, q_scale)  # [B, H, S, D]
 
-    # Softmax in compute dtype (DL16) — no expansion needed
-    attn_weights = torch.softmax(logits, dim=-1, dtype=compute_dtype)
+        # K^T: key_cache [B, n_kv, L, D] → transpose to [B, n_kv, D, L]
+        # GQA expand: unsqueeze head-group dim → [B, n_kv, 1, D, L]
+        # then expand to [B, n_kv, kv_repeat, D, L] and reshape to [B, H, D, L]
+        k_t = key_cache.transpose(-2, -1)  # [B, n_kv, D, L]
+        k_t_expanded = k_t.unsqueeze(2).expand(B, n_kv, kv_repeat, D, L).reshape(B, H, D, L)
+
+        # FP8 × FP8 → FP16: scores_raw [B, H, S, L]
+        scores_raw = torch.ops.spyre.scaled_bmm(q_fp8, k_t_expanded, out_dtype=torch.float16)
+
+        # Scale compensation: scores = scores_raw × q_scale × k_scale × (1/√D)
+        # q_scale: [B, H, S, 1], k_scale: [B, n_kv, L] → expand to [B, H, 1, L]
+        k_scale_expanded = k_scale.unsqueeze(2).expand(B, n_kv, kv_repeat, L).reshape(B, H, L)
+        scores = scores_raw * q_scale * k_scale_expanded.unsqueeze(-2) * scaling
+
+        # Apply causal mask (additive, -inf for masked positions)
+        if attn_mask is not None:
+            scores = scores + attn_mask.to(scores.dtype)
+
+        attn_weights = torch.softmax(scores, dim=-1).to(compute_dtype)
+    else:
+        # -----------------------------------------------------------------
+        # Option 2 fallback (CPU): dequantize K → DL16, run DL16 QK^T
+        # -----------------------------------------------------------------
+        k_dl16 = (
+            key_cache.to(torch.float16)
+            * k_scale.unsqueeze(-1).to(torch.float16)
+        ).to(compute_dtype)
+        k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
+        logits = torch.matmul(q, k_expanded.transpose(-2, -1)) * scaling
+        if attn_mask is not None:
+            logits = logits + attn_mask
+        attn_weights = torch.softmax(logits, dim=-1, dtype=compute_dtype)
 
     # AV multiply: DL16 matmul.  V is stored unquantized.
-    # value_cache: [B, n_kv, L, D_v]
     v_expanded = value_cache.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D_v]
     attn_out = torch.matmul(attn_weights, v_expanded)             # [B, H, S, D_v]
     return attn_out
