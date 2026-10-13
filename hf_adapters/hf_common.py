@@ -25,7 +25,7 @@ import math
 import os
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
@@ -1526,22 +1526,22 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
 def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None, *, option: int = 1):
     """Allocate per-layer FP8 KV cache tensors for use with ``Fp8KVStandardGQABlock``.
 
-    Returns ``(key_caches, key_scale_caches, value_caches)`` where:
+    **Option 2** returns a **3-tuple** ``(key_caches, key_scale_caches, value_caches)``.
 
-    * ``key_caches[i]``       — FP8 key cache (shape depends on ``option``):
-                                 option 1: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` QFP8WT.
+    **Option 1** returns a **4-tuple**
+    ``(key_caches, key_scale_caches, value_caches, tail_bufs_list)`` where
+    ``tail_bufs_list[i] = (key_tail_buf, value_tail_buf)`` — one pair per layer.
+    The tail buffers are ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 tensors used to
+    stage decode tokens (``n=1``) that do not yet fill a complete FP8 block.
+
+    Cache shapes:
+
+    * ``key_caches[i]``       — option 1: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` QFP8WT.
                                  option 2: ``[B, n_kv, L, D]`` QFP8CH (standard).
     * ``key_scale_caches[i]`` — option 1: ``[NUM_BLOCKS, 1, 1, 1]`` dtype.
                                  option 2: ``[B, n_kv, L, 1]`` dtype.
     * ``value_caches[i]``     — option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` dtype.
                                  option 2: ``[B, n_kv, L, head_dim]`` dtype.
-
-    For option 1 the caller must also track ``key_tail_bufs`` and ``value_tail_bufs``
-    (the 4th element from
-    :func:`~hf_adapters.fp8_kv_cache.allocate_fp8_kv_cache_tensors`, which returns
-    a 4-tuple ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``).
-    Call :func:`~hf_adapters.fp8_kv_cache.allocate_fp8_kv_cache_tensors` directly per-layer
-    to obtain the tail buffers; this function discards them.
 
     Args:
         option: 1 = block-scatter QFP8WT layout (Option 1 direct-FP8-matmul).
@@ -1555,12 +1555,14 @@ def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None,
     key_caches = []
     key_scale_caches = []
     value_caches = []
+    tail_bufs_list = []   # option 1 only; empty for option 2
     for (n_kv, hd, vhd) in shapes:
         result = allocate_fp8_kv_cache_tensors(
             batch_size, n_kv, max_cache_len, hd, dtype, device, option=option,
         )
         if option == 1:
-            kc, ksc, vc, _tail_bufs = result
+            kc, ksc, vc, tail_bufs = result
+            tail_bufs_list.append(tail_bufs)
         else:
             kc, ksc, vc = result
         key_caches.append(kc)
@@ -1571,10 +1573,14 @@ def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None,
                 batch_size, n_kv, max_cache_len, vhd, dtype, device, option=option,
             )
             if option == 1:
-                _, _, vc, _tail_bufs = v_result
+                _, _, vc, _v_tail = v_result
+                # Replace vtail with the one sized for vhd
+                tail_bufs_list[-1] = (tail_bufs_list[-1][0], _v_tail[1])
             else:
                 _, _, vc = v_result
         value_caches.append(vc)
+    if option == 1:
+        return key_caches, key_scale_caches, value_caches, tail_bufs_list
     return key_caches, key_scale_caches, value_caches
 
 
@@ -2371,9 +2377,14 @@ def generate(
 
     if use_fp8_kv:
         _fp8_kv_opt = getattr(model, "_spyre_fp8_kv_opt", 1)
-        key_caches, key_scale_caches, value_caches = allocate_fp8_kv_caches(
+        _fp8_alloc = allocate_fp8_kv_caches(
             model, batch_size, max_cache_len, model_d_type, option=_fp8_kv_opt,
         )
+        if _fp8_kv_opt == 1:
+            key_caches, key_scale_caches, value_caches, _fp8_tail_bufs = _fp8_alloc
+        else:
+            key_caches, key_scale_caches, value_caches = _fp8_alloc
+            _fp8_tail_bufs = None
     else:
         key_caches, value_caches = allocate_kv_caches(
             model, batch_size, max_cache_len, model_d_type
@@ -2444,6 +2455,27 @@ def generate(
         }
     # ── end KV instrumentation ───────────────────────────────────────────────
 
+    # Option 1 FP8 KV — decode tail state (managed eagerly, outside torch.compile).
+    # ``_fp8_tail_pos``:  next slot to fill within [B, n_kv, FP8_BLOCK_SIZE, D] bufs.
+    # ``_fp8_next_block``: next committed-block index to write when a tail flushes.
+    # ``_fp8_block_indices_list``: per-layer [NUM_BLOCKS, 1] int32 device tensors
+    #   pre-built here so the compiled graph can index_select without constructing
+    #   tensors inside torch.compile.
+    _fp8_tail_pos = 0
+    _fp8_next_block = 0
+    _fp8_block_indices_list = None
+    if use_fp8_kv and _fp8_tail_bufs is not None:
+        from hf_adapters.fp8_kv_cache import FP8_BLOCK_SIZE as _FP8_BS
+        # padded_len is always a multiple of the prefill chunk (512 = 4 × FP8_BLOCK_SIZE),
+        # so after prefill the tail is empty and _fp8_tail_pos starts at 0.
+        _fp8_next_block = padded_len // _FP8_BS
+        _fp8_block_indices_list = [
+            torch.arange(key_caches[i].shape[0], dtype=torch.int32)
+            .unsqueeze(1)
+            .to(key_caches[i].device)
+            for i in range(len(key_caches))
+        ]
+
     # Decode state. Every decode step writes exactly one token at
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
     previous_tokens = None
@@ -2481,6 +2513,13 @@ def generate(
                     prompt_offsets,
                     dtype=model_d_type,
                 )
+                # Option 1 FP8 KV: cache_index must be block indices [0..num_prefill_blocks-1],
+                # not token positions, because fp8_kv_cache_update(option=1) scatters by block.
+                _prefill_cache_idx = (
+                    torch.arange(padded_len // _FP8_BS, dtype=torch.int32, device=DEVICE)
+                    if _fp8_tail_bufs is not None
+                    else make_cache_index(0, padded_len, DEVICE)
+                )
                 prefill_kwargs: dict = dict(
                     model=model,
                     input_ids=input_ids,
@@ -2488,7 +2527,7 @@ def generate(
                     attention_mask=prefill_mask,
                     key_caches=prefill_key_caches,
                     value_caches=prefill_value_caches,
-                    cache_index=make_cache_index(0, padded_len, DEVICE),
+                    cache_index=_prefill_cache_idx,
                     **normalized_token_inputs,
                 )
                 if key_scale_caches is not None:
@@ -2496,6 +2535,12 @@ def generate(
                         key_scale_caches, prefill_kv_len, chunked_prefill
                     )
                     prefill_kwargs["key_scale_caches"] = prefill_key_scale_caches
+                if _fp8_tail_bufs is not None:
+                    # Option 1 prefill: pass tail bufs and block_indices so the
+                    # compiled attention blocks can attend over the (empty) tail.
+                    prefill_kwargs["key_tail_bufs"] = [t[0] for t in _fp8_tail_bufs]
+                    prefill_kwargs["value_tail_bufs"] = [t[1] for t in _fp8_tail_bufs]
+                    prefill_kwargs["block_indices_list"] = _fp8_block_indices_list
                 logits = prefill_fn(**prefill_kwargs)
             else:
                 # Keep Lk fixed at the complete prefill extent while advancing
@@ -2518,13 +2563,24 @@ def generate(
                         dtype=model_d_type,
                         query_start=chunk_start,
                     )
-                    fwd_kwargs: dict = dict(
-                        cache_index=make_cache_index(
-                            chunk_start, query_chunk_size, DEVICE
-                        ),
+                    # Option 1 FP8 KV: cache_index is block indices for this chunk.
+                    _chunk_cache_idx = (
+                        torch.arange(
+                            chunk_start // _FP8_BS,
+                            (chunk_start + query_chunk_size) // _FP8_BS,
+                            dtype=torch.int32,
+                            device=DEVICE,
+                        )
+                        if _fp8_tail_bufs is not None
+                        else make_cache_index(chunk_start, query_chunk_size, DEVICE)
                     )
+                    fwd_kwargs: dict = dict(cache_index=_chunk_cache_idx)
                     if prefill_key_scale_caches is not None:
                         fwd_kwargs["key_scale_caches"] = prefill_key_scale_caches
+                    if _fp8_tail_bufs is not None:
+                        fwd_kwargs["key_tail_bufs"] = [t[0] for t in _fp8_tail_bufs]
+                        fwd_kwargs["value_tail_bufs"] = [t[1] for t in _fp8_tail_bufs]
+                        fwd_kwargs["block_indices_list"] = _fp8_block_indices_list
                     logits = run_forward_fn(  # type: ignore[misc]
                         model,
                         input_ids[:, chunk_start:chunk_end].to(DEVICE),
@@ -2561,10 +2617,16 @@ def generate(
                     decode_mask, decode_mask_heads
                 )
             cache_index = make_cache_index(current_cache_len, 1, DEVICE)
+
             if decode_fn is None:
                 decode_fwd_kwargs: dict = dict(cache_index=cache_index)
                 if key_scale_caches is not None:
                     decode_fwd_kwargs["key_scale_caches"] = key_scale_caches
+                if _fp8_tail_bufs is not None:
+                    decode_fwd_kwargs["key_tail_bufs"] = [t[0] for t in _fp8_tail_bufs]
+                    decode_fwd_kwargs["value_tail_bufs"] = [t[1] for t in _fp8_tail_bufs]
+                    decode_fwd_kwargs["block_indices_list"] = _fp8_block_indices_list
+                    decode_fwd_kwargs["fp8_tail_pos"] = _fp8_tail_pos
                 logits = run_forward_fn(  # type: ignore[misc]
                     model,
                     next_input,
@@ -2586,9 +2648,40 @@ def generate(
                 )
                 if key_scale_caches is not None:
                     decode_kwargs["key_scale_caches"] = key_scale_caches
+                if _fp8_tail_bufs is not None:
+                    decode_kwargs["key_tail_bufs"] = [t[0] for t in _fp8_tail_bufs]
+                    decode_kwargs["value_tail_bufs"] = [t[1] for t in _fp8_tail_bufs]
+                    decode_kwargs["block_indices_list"] = _fp8_block_indices_list
+                    decode_kwargs["fp8_tail_pos"] = _fp8_tail_pos
                 logits = decode_fn(**decode_kwargs)
             next_logits = logits.to("cpu")[:, -1, :]
             current_cache_len += 1
+
+            # Option 1 FP8 KV — post-forward tail-pos advance and block flush.
+            # K/V writes into the tail buf are done inside
+            # Fp8KVStandardGQAAttention.pre_attn (fp8_tail_pos kwarg selects slot).
+            if _fp8_tail_bufs is not None:
+                from hf_adapters.fp8_kv_cache import (
+                    FP8_BLOCK_SIZE as _FP8_BS,
+                    fp8_kv_cache_flush_tail,
+                )
+                _fp8_tail_pos += 1
+                if _fp8_tail_pos == _FP8_BS:
+                    # Tail is full — flush each layer's tail buf to the committed cache.
+                    for _li in range(len(key_caches)):
+                        fp8_kv_cache_flush_tail(
+                            _fp8_tail_bufs[_li][0],
+                            _fp8_tail_bufs[_li][1],
+                            key_caches[_li],
+                            key_scale_caches[_li],
+                            value_caches[_li],
+                            _fp8_next_block,
+                        )
+                        # Zero the tail bufs so stale data doesn't affect future steps.
+                        _fp8_tail_bufs[_li][0].zero_()
+                        _fp8_tail_bufs[_li][1].zero_()
+                    _fp8_tail_pos = 0
+                    _fp8_next_block += 1
 
         # Crop away Spyre LM-head padding before exposing logits or selecting a
         # token. Stock generation only sees the model's configured vocabulary.
@@ -2947,8 +3040,14 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
         key_scale_cache,
         value_cache,
         cache_index,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        fp8_tail_pos=None,
     ):
-        from hf_adapters.fp8_kv_cache import fp8_kv_cache_update
+        from hf_adapters.fp8_kv_cache import (
+            fp8_kv_cache_update,
+            fp8_kv_cache_update_tail,
+        )
 
         bsz, seq_len, _ = hidden_states.shape
         q = (
@@ -2970,13 +3069,29 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
-        key_cache, key_scale_cache, value_cache = fp8_kv_cache_update(
-            k, v, key_cache, key_scale_cache, value_cache, cache_index,
-            option=self._fp8_kv_opt,
-        )
+        if self._fp8_kv_opt == 1 and seq_len == 1 and key_tail_buf is not None:
+            # Option 1 decode: write K/V into the DL16 tail buffer at fp8_tail_pos.
+            # The committed block cache is NOT updated here; fp8_kv_cache_flush_tail
+            # (called by generate() when the tail is full) handles that.
+            fp8_kv_cache_update_tail(k, v, key_tail_buf, value_tail_buf, fp8_tail_pos)
+        else:
+            key_cache, key_scale_cache, value_cache = fp8_kv_cache_update(
+                k, v, key_cache, key_scale_cache, value_cache, cache_index,
+                option=self._fp8_kv_opt,
+            )
         return q, key_cache, key_scale_cache, value_cache
 
-    def attn_core(self, q, key_cache, key_scale_cache, value_cache, attn_mask):
+    def attn_core(
+        self,
+        q,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        attn_mask,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        block_indices=None,
+    ):
         from hf_adapters.fp8_kv_cache import fp8_attn_core
 
         bsz, _, seq_len, _ = q.shape
@@ -2985,6 +3100,9 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
             q, key_cache, key_scale_cache, value_cache,
             attn_mask, self.scaling, compute_dtype,
             option=self._fp8_kv_opt,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            block_indices=block_indices,
         )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -2998,12 +3116,24 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
         key_scale_cache,
         value_cache,
         cache_index,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        block_indices=None,
+        fp8_tail_pos=None,
     ):
         q, key_cache, key_scale_cache, value_cache = self.pre_attn(
             hidden_states, selected_freqs,
             key_cache, key_scale_cache, value_cache, cache_index,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            fp8_tail_pos=fp8_tail_pos,
         )
-        attn_out = self.attn_core(q, key_cache, key_scale_cache, value_cache, attn_mask)
+        attn_out = self.attn_core(
+            q, key_cache, key_scale_cache, value_cache, attn_mask,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            block_indices=block_indices,
+        )
         return attn_out, key_cache, key_scale_cache, value_cache
 
 
@@ -3011,7 +3141,10 @@ class Fp8KVStandardGQABlock(nn.Module):
     """``StandardGQABlock`` variant wired to ``Fp8KVStandardGQAAttention``.
 
     The block signature gains one extra cache tensor: the key scale cache.
-    ``forward`` threads it through untouched between the two compiled regions.
+    For Option 1, the block also accepts ``key_tail_buf``, ``value_tail_buf``,
+    ``block_indices``, and ``fp8_tail_pos`` — threaded through both compiled
+    regions so ``fp8_attn_core`` can use the DL16 tail at attention time and
+    ``pre_attn`` can write the decode token into the tail at the correct slot.
 
     Args:
         layer: original decoder layer.
@@ -3038,17 +3171,35 @@ class Fp8KVStandardGQABlock(nn.Module):
         key_scale_cache,
         value_cache,
         cache_index,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        fp8_tail_pos=None,
     ):
         h = self.input_layernorm(hidden_states)
         return self.self_attn.pre_attn(
-            h, selected_freqs, key_cache, key_scale_cache, value_cache, cache_index
+            h, selected_freqs, key_cache, key_scale_cache, value_cache, cache_index,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            fp8_tail_pos=fp8_tail_pos,
         )
 
     def _region_attention_tail(
-        self, hidden_states, q, key_cache, key_scale_cache, value_cache, attn_mask
+        self,
+        hidden_states,
+        q,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        attn_mask,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        block_indices=None,
     ):
         attn_out = self.self_attn.attn_core(
-            q, key_cache, key_scale_cache, value_cache, attn_mask
+            q, key_cache, key_scale_cache, value_cache, attn_mask,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            block_indices=block_indices,
         )
 
         if self.residual_multiplier is None:
@@ -3074,14 +3225,32 @@ class Fp8KVStandardGQABlock(nn.Module):
         key_scale_cache,
         value_cache,
         cache_index,
+        key_tail_buf=None,
+        value_tail_buf=None,
+        block_indices=None,
+        fp8_tail_pos=None,
     ):
         q, key_cache, key_scale_cache, value_cache = self._pre_attn(
             hidden_states, selected_freqs,
             key_cache, key_scale_cache, value_cache, cache_index,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            fp8_tail_pos=fp8_tail_pos,
         )
-        with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
+        # Option 1 block-layout cache [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE] is
+        # incompatible with the [B, n_kv, L, D] shape that
+        # _named_standard_gqa_attention_inputs expects — skip it for Option 1.
+        ctx = (
+            _named_standard_gqa_attention_inputs(q, key_cache, value_cache)
+            if self.self_attn._fp8_kv_opt != 1
+            else nullcontext()
+        )
+        with ctx:
             h = self._attention_tail(
-                hidden_states, q, key_cache, key_scale_cache, value_cache, attn_mask
+                hidden_states, q, key_cache, key_scale_cache, value_cache, attn_mask,
+                key_tail_buf=key_tail_buf,
+                value_tail_buf=value_tail_buf,
+                block_indices=block_indices,
             )
         return h, key_cache, key_scale_cache, value_cache
 

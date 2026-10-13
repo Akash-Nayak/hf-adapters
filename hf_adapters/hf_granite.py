@@ -53,11 +53,19 @@ def _run_backbone_forward(
     value_caches,
     cache_index,
     key_scale_caches=None,
+    key_tail_bufs=None,
+    value_tail_bufs=None,
+    block_indices_list=None,
+    fp8_tail_pos=None,
 ):
     """Granite 3.3 backbone: embedding * multiplier, blocks, norm.
 
     When ``key_scale_caches`` is provided (FP8 KV cache mode), each compiled
     block receives the extra per-token K scale cache and returns it updated.
+
+    For Option 1 FP8 KV cache, ``key_tail_bufs``, ``value_tail_bufs``,
+    ``block_indices_list``, and ``fp8_tail_pos`` are additionally threaded
+    through each block so the decode tail buffer is read and written correctly.
     """
     backbone = get_backbone(model)
     h = backbone.embed_tokens(input_ids)
@@ -76,8 +84,8 @@ def _run_backbone_forward(
                 value_caches[i],
                 cache_index,
             )
-    else:
-        # FP8 KV cache path — block signature carries key_scale_cache
+    elif key_tail_bufs is None:
+        # FP8 KV cache — Option 2 (no tail bufs)
         for i, compiled_block in enumerate(model._spyre_compiled_blocks):
             h, key_caches[i], key_scale_caches[i], value_caches[i] = compiled_block(
                 h,
@@ -87,6 +95,22 @@ def _run_backbone_forward(
                 key_scale_caches[i],
                 value_caches[i],
                 cache_index,
+            )
+    else:
+        # FP8 KV cache — Option 1 (block layout + DL16 tail)
+        for i, compiled_block in enumerate(model._spyre_compiled_blocks):
+            h, key_caches[i], key_scale_caches[i], value_caches[i] = compiled_block(
+                h,
+                selected_freqs,
+                attn_mask,
+                key_caches[i],
+                key_scale_caches[i],
+                value_caches[i],
+                cache_index,
+                key_tail_buf=key_tail_bufs[i],
+                value_tail_buf=value_tail_bufs[i],
+                block_indices=block_indices_list[i],
+                fp8_tail_pos=fp8_tail_pos,
             )
 
     h = model._spyre_compiled_norm(h)
@@ -102,6 +126,10 @@ def _run_forward(
     value_caches,
     cache_index,
     key_scale_caches=None,
+    key_tail_bufs=None,
+    value_tail_bufs=None,
+    block_indices_list=None,
+    fp8_tail_pos=None,
 ):
     """Granite 3.3 causal-LM forward: backbone + head / scaling."""
     h = _run_backbone_forward(
@@ -113,6 +141,10 @@ def _run_forward(
         value_caches,
         cache_index,
         key_scale_caches=key_scale_caches,
+        key_tail_bufs=key_tail_bufs,
+        value_tail_bufs=value_tail_bufs,
+        block_indices_list=block_indices_list,
+        fp8_tail_pos=fp8_tail_pos,
     )
     logits = model.lm_head(h)
     return logits / text_config(model.config).logits_scaling
@@ -125,14 +157,18 @@ def _fp16_rmsnorm_forward(self, h):
     return self.weight * (h * torch.rsqrt(variance + self.variance_epsilon))
 
 
-def prepare_for_spyre(model, fp8_kv_cache: bool = False):
+def prepare_for_spyre(model, fp8_kv_cache: bool = False, fp8_kv_opt: int = 1):
     """Apply Spyre adaptations to Granite 3.3 model in-place.
 
     Args:
-        fp8_kv_cache: When ``True``, use FP8 KV cache — K is stored as E4M3
-            and QK^T is computed in FP8 via ``spyre.scaled_mm``.  V remains
-            in the compute dtype.  Requires the model to already be prepared
-            with FP8 weight loading (``swap_linears_to_fp8(direct_load=True)``).
+        fp8_kv_cache: When ``True``, enable FP8 KV cache — K is stored as E4M3,
+            V remains in the compute dtype.
+        fp8_kv_opt: FP8 KV cache option (only used when ``fp8_kv_cache=True``).
+            1 = Option 1: direct-FP8-matmul via ``spyre.scaled_bmm`` (target;
+                requires ``backup/feat-fp8-paged-attention-substick-scatter`` compiler).
+                K is written as QFP8WT, no K dequantize at decode time.
+            2 = Option 2: dequantize-K via ``torch.matmul`` (works on device today).
+                K is written as QFP8CH, dequantized to DL16 before each QK^T.
     """
     backbone = get_backbone(model)
     # FP8 checkpoints only; runs before the blocks are built so they close over
@@ -157,10 +193,12 @@ def prepare_for_spyre(model, fp8_kv_cache: bool = False):
     pad_lm_head(model)
     if fp8_kv_cache:
         model._spyre_compiled_blocks = prepare_standard_gqa_blocks_fp8_kv(
-            backbone.layers, True
+            backbone.layers, True, fp8_kv_opt=fp8_kv_opt
         )
         model._spyre_fp8_kv_cache = True
-        print(f"FP8 KV cache: enabled (K stored as E4M3, QK^T in FP8)")
+        model._spyre_fp8_kv_opt = fp8_kv_opt
+        opt_label = "Option 1: direct-FP8-matmul" if fp8_kv_opt == 1 else "Option 2: dequantize-K"
+        print(f"FP8 KV cache: enabled — {opt_label}")
     else:
         model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
         model._spyre_fp8_kv_cache = False

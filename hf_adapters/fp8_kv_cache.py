@@ -500,7 +500,20 @@ def fp8_attn_core(
             scores = scores_committed
 
         if attn_mask is not None:
-            # attn_mask [1, 1, S, total_L+tail] broadcasts over [n_kv, kv_repeat, ...].
+            # attn_mask from generate() is [B, H_or_1, S, mask_L].
+            # Option 1 scores are [n_kv, kv_repeat, S, scores_L] — the head dim
+            # differs (n_kv×kv_repeat layout vs H or 1).  Collapse to [1,1,S,L]
+            # so the mask broadcasts cleanly over both dims.
+            # Also pad mask_L → scores_L with large negatives when the tail buffer
+            # extends beyond max_cache_len.
+            attn_mask = attn_mask[:, :1]          # [B, 1, S, mask_L]
+            mask_L = attn_mask.shape[-1]
+            scores_L = scores.shape[-1]
+            if scores_L > mask_L:
+                pad = attn_mask.new_full(
+                    (*attn_mask.shape[:-1], scores_L - mask_L), -10000.0
+                )
+                attn_mask = torch.cat([attn_mask, pad], dim=-1)
             scores = scores + attn_mask.to(scores.dtype)
 
         attn_weights = torch.softmax(scores, dim=-1, dtype=compute_dtype)

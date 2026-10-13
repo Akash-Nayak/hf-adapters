@@ -35,6 +35,11 @@ Tests cover:
   * ``fp8_attn_core(option=1)`` — ``spyre.scaled_bmm`` QK^T + DL16 tail
     concat. Matches DL16 SDPA within tolerance.
 
+  End-to-end generate() — Option 1 with real model:
+  * ``test_fp8_opt1_generate_e2e`` — full prefill → decode tail write →
+    tail flush → attend pipeline using ``ibm-granite/granite-3.3-8b-instruct-FP8``
+    on Spyre.
+
 Run on a Spyre pod::
 
     pytest -s -vvv tests/spyre/test_fp8_kv_cache_spyre.py
@@ -688,3 +693,102 @@ def test_fp8_opt1_decode_accuracy(dtype):
     assert out_fp8.shape == expected.shape, f"{out_fp8.shape} vs {expected.shape}"
     max_abs = (out_fp8.float() - expected.float()).abs().max().item()
     assert max_abs < 0.20, f"opt1 decode GQA max_abs={max_abs:.4f} (dtype={dtype})"
+
+
+# ---------------------------------------------------------------------------
+# 6.  Fp8KVStandardGQABlock — compiled forward with tail bufs on Spyre
+#
+# Tests that the new block.forward() signature (key_tail_buf, value_tail_buf,
+# block_indices, fp8_tail_pos) compiles and runs correctly on device.
+# ---------------------------------------------------------------------------
+
+class _BlockForwardOpt1(torch.nn.Module):
+    """Wraps Fp8KVStandardGQABlock.forward for torch.compile.
+
+    Passes tail bufs and block_indices as tensor arguments so the compiled
+    graph can read/write them without constructing tensors inside torch.compile.
+    """
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        key_scale_cache,
+        value_cache,
+        cache_index,
+        key_tail_buf,
+        value_tail_buf,
+        block_indices,
+        fp8_tail_pos,
+    ):
+        return self.block(
+            hidden_states, selected_freqs, attn_mask,
+            key_cache, key_scale_cache, value_cache, cache_index,
+            key_tail_buf=key_tail_buf,
+            value_tail_buf=value_tail_buf,
+            block_indices=block_indices,
+            fp8_tail_pos=fp8_tail_pos,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7.  End-to-end generate() with Option 1 FP8 KV cache on Spyre
+# ---------------------------------------------------------------------------
+
+_GRANITE_FP8_MODEL = "ibm-granite/granite-3.3-8b-instruct-FP8"
+
+
+def test_fp8_opt1_generate_e2e():
+    """Option 1 FP8 KV cache: end-to-end generate() produces non-empty output.
+
+    Loads ``ibm-granite/granite-3.3-8b-instruct-FP8`` (direct E4M3 load) with
+    Option 1 FP8 KV cache enabled, runs a short generate() call, and checks:
+      * Output is a non-empty string.
+      * No exception is raised (covers the full prefill → decode tail write →
+        tail flush → attend pipeline on device).
+    """
+    import torch_spyre  # noqa: F401
+    from transformers import AutoTokenizer
+
+    from hf_adapters import AutoSpyreModelForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained(_GRANITE_FP8_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # fp8_kv_cache=True uses Option 1 by default (fp8_kv_opt=1 in prepare_for_spyre).
+    # from_pretrained handles load + prepare_for_spyre + move_to_spyre in one call.
+    model = AutoSpyreModelForCausalLM.from_pretrained(
+        _GRANITE_FP8_MODEL,
+        fp8_kv_cache=True,
+    )
+
+    prompt = "What is 2 + 2?"
+    enc = tokenizer(
+        [prompt],
+        return_tensors="pt",
+        padding="max_length",
+        max_length=128,
+        truncation=True,
+    )
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=16,
+        )
+
+    # Decode new tokens only
+    in_len = enc["input_ids"].shape[-1]
+    new_tokens = out[:, in_len:] if out.shape[-1] > in_len else out
+    text = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+
+    assert isinstance(text, str), f"expected str output, got {type(text)}"
+    assert len(text.strip()) > 0, "generate() returned empty output"
+    print(f"\n[test_fp8_opt1_generate_e2e] output: {text!r}")
