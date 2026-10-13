@@ -14,8 +14,10 @@
 
 """FP8 KV cache for Spyre — two option variants selectable at runtime.
 
-Both options store K as FP8 E4M3 and V unquantized in the compute dtype.
-They differ only in the QK^T matmul path:
+Both options store K as FP8 E4M3.  Option 1 also stores V as FP8 QFP8CH
+(dequantized at attention time) giving a full ~2× KV memory saving.
+Option 2 stores V unquantized in the compute dtype.
+They differ in the QK^T matmul path:
 
   **Option 1 — direct-FP8-matmul** (target; block-scatter layout)
     K is written in **paged block layout** ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]``
@@ -24,11 +26,14 @@ They differ only in the QK^T matmul path:
     buffer ``[B, n_kv, FP8_BLOCK_SIZE, D]`` accumulates decode tokens (n=1) that do
     not yet fill a complete block; it is attended via standard ``torch.matmul``.
     Q is quantized to FP8 per-token before ``scaled_bmm``.
+    V is stored as QFP8CH ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` with a
+    parallel scale cache ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, 64]`` (trailing dim
+    padded to 64 for stick-aligned scatter).  Dequantized at attention time.
 
   **Option 2 — dequantize-K** (fallback; works on device today)
     K is written as QFP8CH (standard, L-inner) at fill time.  At attention
     time K is dequantized back to DL16 and the standard ``torch.matmul`` path
-    is used.  Gives the same 2× K cache memory saving with no QK^T speedup.
+    is used.  V is stored unquantized (DL16).
 
 Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
 :func:`fp8_attn_core`, or pass ``fp8_kv_opt`` to
@@ -39,15 +44,23 @@ Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
 ### Cache tensor shapes
 
   Option 1 (Spyre):
-    key_cache        ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` float8_e4m3fn
-    key_scale_cache  ``[NUM_BLOCKS, 1, 1, 1]``                 compute dtype  scalar per block
-    value_cache      ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype  token-major
-    key_tail_buf     ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype  decode staging
+    key_cache         ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` float8_e4m3fn  QFP8WT
+    key_scale_cache   ``[NUM_BLOCKS, 1, 1, 1]``                  compute dtype  per-block scalar
+    value_cache       ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]``  float8_e4m3fn  QFP8CH
+    value_scale_cache ``[NUM_BLOCKS, 1, 1, 1]``                  compute dtype  per-block scalar
+    key_tail_buf      ``[B, n_kv, FP8_BLOCK_SIZE, D]``           compute dtype  decode staging
+    value_tail_buf    ``[B, n_kv, FP8_BLOCK_SIZE, D]``           compute dtype  decode staging (DL16)
 
     ``NUM_BLOCKS = max_cache_len // FP8_BLOCK_SIZE``
 
-    ``allocate_fp8_kv_cache_tensors(option=1)`` returns a **4-tuple**
-    ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``.
+    Both scale caches use the same ``[NUM_BLOCKS, 1, 1, 1]`` shape — one scalar per
+    committed block (amax over all tokens in the block), matching the reference
+    ``ScaledPagedAttnStore`` design.  This avoids stick-alignment issues and the
+    per-token 64-wide padding required by a per-token scale scatter.
+
+    ``allocate_fp8_kv_cache_tensors(option=1)`` returns a **5-tuple**
+    ``(key_cache, key_scale_cache, value_cache, value_scale_cache,
+    (key_tail_buf, value_tail_buf))``.
 
   Option 2 (Spyre + CPU):
     key_cache        ``[B, n_kv, L, D]`` float8_e4m3fn
@@ -73,12 +86,16 @@ Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
     3. Reshape K FP8 to ``[num_b, n_kv, D, FP8_BLOCK_SIZE]``.
     4. ``key_cache.index_copy_(0, block_idx, ...)`` — full-stick scatter.
     5. ``key_scale_cache.index_copy_(0, block_idx, sk.reshape(num_b, 1, 1, 1))``.
-    6. V ``[B, n_kv, n, D]`` → ``[num_b, FP8_BLOCK_SIZE, n_kv, D]`` → scatter dim 0.
+    6. V ``[B, n_kv, n, D]`` → unsqueeze → ``[1, n, n_kv, D]`` cast to FP16.
+    7. ``abs().amax() / FP8_MAX`` → per-block scalar ``sv``; clamp to ``SCALE_EPS``.
+    8. ``quantize_fp8_with_scale(v_in, sv)`` → V FP8 ``[1, n, n_kv, D]``.
+    9. Reshape V FP8 to ``[num_b, FP8_BLOCK_SIZE, n_kv, D]`` → scatter dim 0.
+   10. ``value_scale_cache.index_copy_(0, block_idx, sv.reshape(num_b, 1, 1, 1))``.
 
   Option 1 (Spyre) — **decode** (``n < FP8_BLOCK_SIZE``, typically ``n=1``):
-    Writes K and V into ``key_tail_buf`` / ``value_tail_buf`` at the tail position
-    computed by the caller.  **Called eagerly (outside torch.compile)**; the tail
-    buffers are fixed-shape tensors passed as-is to ``fp8_attn_core``.
+    Writes K and V (DL16) into ``key_tail_buf`` / ``value_tail_buf`` at the tail
+    position computed by the caller.  **Called eagerly (outside torch.compile)**;
+    the tail buffers are fixed-shape DL16 tensors passed as-is to ``fp8_attn_core``.
     When the tail is full (``tail_pos == FP8_BLOCK_SIZE``), the caller flushes it
     by calling ``fp8_kv_cache_flush_tail``.
 
@@ -92,7 +109,7 @@ Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
     Same scale/quantize logic but using ``_quantize_fp8_per_token`` (CPU only).
     FP8 ``index_copy_`` not supported on CPU — reinterprets as uint8.
 
-  V is always scattered unchanged into ``value_cache``.
+  V is always scattered unchanged (DL16) into ``value_cache`` for Option 2 / CPU.
 
 ---
 
@@ -104,7 +121,8 @@ Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
        apply per-token scale compensation.
     3. Concatenate committed block scores; add DL16 tail scores (``torch.matmul``).
     4. Apply mask, softmax.
-    5. AV: reshape committed V to ``[n_kv, 1, total_L, D]``; cat tail V; matmul.
+    5. AV (committed): gather V FP8, dequantize with per-block scalar scale broadcast
+       over ``[n_kv, 1, total_L, D]``; cat DL16 tail V; matmul.
     6. Reshape output back to ``[B, H, S, D]``.
 
   Option 2 (Spyre + CPU):
@@ -174,8 +192,9 @@ def fp8_kv_cache_update(
     cache_index: torch.Tensor,
     *,
     option: int = 1,
+    value_scale_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Write K (FP8) and V into the **committed block caches** at the given positions.
+    """Write K (FP8) and V (FP8 for Option 1) into the **committed block caches**.
 
     For Option 1 this handles the **prefill path only** (``n`` is a multiple of
     ``FP8_BLOCK_SIZE``).  Decode writes (``n=1``) go through
@@ -188,10 +207,10 @@ def fp8_kv_cache_update(
             Option 1 Spyre: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT.
             Option 2 / CPU: ``[B, n_kv, L, D]`` FP8 QFP8CH.
         key_scale_cache:
-            Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype scalar per block.
+            Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype per-block scalar.
             Option 2: ``[B, n_kv, L, 1]`` compute dtype per-token scale.
         value_cache:
-            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` FP8 QFP8CH.
             Option 2: ``[B, n_kv, L, D]`` compute dtype.
         cache_index:
             **Option 1**: ``[num_b]`` int32 **block** indices
@@ -202,6 +221,10 @@ def fp8_kv_cache_update(
             (``arange(start, start+n)``).
         option: 1 = block-scatter QFP8WT fill + ``scaled_bmm`` at attend.
                 2 = QFP8CH fill + dequantize-K at attend.
+        value_scale_cache:
+            Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype per-block scalar.
+            One scalar per block (amax over all V tokens in the block).
+            Matches ``ScaledPagedAttnStore`` reference design.
 
     Returns:
         Updated ``(key_cache, key_scale_cache, value_cache)``.
@@ -248,9 +271,27 @@ def fp8_kv_cache_update(
             0, block_idx, sk.reshape(1, 1, 1, 1).expand(num_b, 1, 1, 1).contiguous()
         )
 
-        # V: [B, n_kv, n, D] → [num_b, FP8_BLOCK_SIZE, n_kv, D]
-        v_blocked = v[0].permute(1, 0, 2).reshape(num_b, FP8_BLOCK_SIZE, n_kv, D)
+        # V: quantize to QFP8CH and scatter.
+        # v [B, n_kv, n, D] → [1, n, n_kv, D] to match [NUM_BLOCKS, FP8_BS, n_kv, D] layout.
+        v_in = v[0].permute(1, 0, 2).unsqueeze(0).to(torch.float16)  # [1, n, n_kv, D]
+        # Per-block scalar scale: amax over all tokens + heads in this set of blocks.
+        # Matches the ScaledPagedAttnStore reference design (one scalar per block).
+        # Using a scalar avoids all stick-alignment issues with per-token scale scatter.
+        sv_scalar = (v_in.float().abs().amax() / FP8_MAX).to(
+            torch.float16
+        ).clamp(min=SCALE_EPS)                                        # scalar FP16
+        v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v_in, sv_scalar)  # [1, n, n_kv, D] QFP8CH
+        # Reshape to [num_b, FP8_BLOCK_SIZE, n_kv, D] for dim-0 block scatter.
+        v_blocked = v_fp8.reshape(num_b, FP8_BLOCK_SIZE, n_kv, D)
         value_cache.index_copy_(0, block_idx, v_blocked)
+        if value_scale_cache is not None:
+            # value_scale_cache [NUM_BLOCKS, 1, 1, 1] — same shape as key_scale_cache.
+            # Scatter sv_scalar once per block: expand scalar → [num_b, 1, 1, 1].
+            sv_blocks = sv_scalar.to(value_scale_cache.dtype).reshape(1, 1, 1, 1).expand(
+                num_b, 1, 1, 1
+            ).contiguous()
+            value_scale_cache.index_copy_(0, block_idx, sv_blocks)
+        return key_cache, key_scale_cache, value_cache
 
     elif on_spyre:
         # ── Option 2 fill on Spyre: write K as QFP8CH ─────────────────────
@@ -316,6 +357,8 @@ def fp8_kv_cache_flush_tail(
     key_scale_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_idx: int,
+    *,
+    value_scale_cache: torch.Tensor | None = None,
 ) -> None:
     """Flush a full tail buffer into the committed block caches (Option 1, in-place).
 
@@ -328,8 +371,10 @@ def fp8_kv_cache_flush_tail(
         value_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 — full tail block.
         key_cache: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT.
         key_scale_cache: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype.
-        value_cache: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+        value_cache: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` FP8 QFP8CH.
         block_idx: integer block index to write into.
+        value_scale_cache: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, 64]`` compute dtype.
+            When provided, the V per-token scale is quantized and written here.
     """
     on_spyre = key_tail_buf.device.type == "spyre"
     B, n_kv, _, D = key_tail_buf.shape
@@ -344,9 +389,17 @@ def fp8_kv_cache_flush_tail(
         # Unsqueeze to [1, n_kv, D, FP8_BLOCK_SIZE] for dim-0 scatter.
         key_cache.index_copy_(0, idx, k_fp8.unsqueeze(0))
         key_scale_cache.index_copy_(0, idx, sk.reshape(1, 1, 1, 1))
-        # V: [B, n_kv, FP8_BLOCK_SIZE, D] → [1, FP8_BLOCK_SIZE, n_kv, D]
-        v_blocked = value_tail_buf[0].permute(1, 0, 2).unsqueeze(0)
-        value_cache.index_copy_(0, idx, v_blocked)
+        # V: [B, n_kv, FP8_BLOCK_SIZE, D] → [1, FP8_BLOCK_SIZE, n_kv, D] FP16
+        v_in = value_tail_buf[0].permute(1, 0, 2).unsqueeze(0).to(torch.float16)
+        # Per-block scalar scale — same design as prefill path and ScaledPagedAttnStore.
+        sv_scalar = (v_in.float().abs().amax() / FP8_MAX).to(
+            torch.float16
+        ).clamp(min=SCALE_EPS)                               # scalar FP16
+        v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v_in, sv_scalar)
+        value_cache.index_copy_(0, idx, v_fp8)
+        if value_scale_cache is not None:
+            sv_block = sv_scalar.to(value_scale_cache.dtype).reshape(1, 1, 1, 1)
+            value_scale_cache.index_copy_(0, idx, sv_block)
     else:
         # Flush is a no-op on CPU — the tail buffer is read directly by fp8_attn_core.
         pass
@@ -371,6 +424,7 @@ def fp8_attn_core(
     value_tail_buf: torch.Tensor | None = None,
     block_indices: torch.Tensor | None = None,
     q_scale: torch.Tensor | None = None,
+    value_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute attention using the FP8 KV cache.
 
@@ -391,7 +445,7 @@ def fp8_attn_core(
             Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` per-block scale.
             Option 2: ``[B, n_kv, L, 1]`` per-token scale.
         value_cache:
-            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` FP8 QFP8CH.
             Option 2: ``[B, n_kv, L, D]`` compute dtype.
         attn_mask: additive causal mask of shape ``[B, 1, S, total_L]``
             where ``total_L = NUM_BLOCKS * FP8_BLOCK_SIZE + FP8_BLOCK_SIZE`` for
@@ -403,7 +457,7 @@ def fp8_attn_core(
         key_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 decode staging
             (Option 1 only; pass zeros when no decode tokens yet).
         value_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 decode staging
-            (Option 1 only).
+            (Option 1 only; not yet flushed to FP8 committed cache).
         block_indices: ``[NUM_BLOCKS, 1]`` int32 tensor on the same device as
             ``key_cache``, containing ``[[0], [1], ..., [NUM_BLOCKS-1]]``.
             Must be pre-built **outside** ``torch.compile`` and passed in as a
@@ -414,6 +468,11 @@ def fp8_attn_core(
             ``quantscalepertokenfp8(q_reshaped.to(float16))``.
             When ``None``, computed eagerly (works for CPU and eager mode; for
             compiled graphs pass this as a pre-built device tensor argument).
+        value_scale_cache: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, 64]`` compute dtype.
+            Option 1 only.  Stick-padded V per-token scale; slice ``[:,:,:,:1]``
+            inside the graph for dequantize broadcast.  When ``None``, V is not
+            dequantized (should not happen in normal Option 1 use; fallback for
+            backwards compatibility).
 
     Returns:
         ``[B, H, S, D_v]`` attention output in compute dtype.
@@ -518,20 +577,37 @@ def fp8_attn_core(
 
         attn_weights = torch.softmax(scores, dim=-1, dtype=compute_dtype)
 
-        # AV multiply — committed V + tail V.
-        # value_cache [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]
+        # AV multiply — committed V (FP8, dequantized) + DL16 tail V.
+        # value_cache [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D] QFP8CH
         # → permute(2,0,1,3) → [n_kv, NUM_BLOCKS, FP8_BLOCK_SIZE, D]
         # → reshape → [n_kv, total_L, D] → unsqueeze(1) → [n_kv, 1, total_L, D]
-        v_flat = (
-            value_cache
-            .permute(2, 0, 1, 3)
+        vc_flat = (
+            value_cache.permute(2, 0, 1, 3)
             .reshape(n_kv, total_L, D)
             .unsqueeze(1)
         )  # [n_kv, 1, total_L, D]
+        if value_scale_cache is not None:
+            # value_scale_cache [NUM_BLOCKS, 1, 1, 1] per-block scalar.
+            # Reshape to [1, 1, NUM_BLOCKS, 1] then expand to [n_kv, 1, total_L, 1]
+            # via repeat on the block dim (each block covers FP8_BLOCK_SIZE positions).
+            # dequantize_fp8_with_scale: fp8todl16(vc_flat) * scale
+            vsc = value_scale_cache.reshape(1, 1, NUM_BLOCKS, 1)   # [1,1,NB,1]
+            vsc_exp = vsc.expand(n_kv, 1, NUM_BLOCKS, 1).reshape(
+                n_kv, 1, NUM_BLOCKS, 1
+            ).repeat(1, 1, FP8_BLOCK_SIZE, 1).reshape(
+                n_kv, 1, total_L, 1
+            )  # [n_kv, 1, total_L, 1]
+            v_flat = torch.ops.spyre.dequantize_fp8_with_scale(
+                vc_flat, vsc_exp
+            )  # [n_kv, 1, total_L, D] DL16
+        else:
+            # Fallback: cast directly (no scale applied — for backwards compat).
+            v_flat = vc_flat
 
         if value_tail_buf is not None:
+            # Tail V is DL16 (not yet flushed to FP8 committed cache).
             v_tail = value_tail_buf[0].unsqueeze(1)          # [n_kv, 1, FP8_BLOCK_SIZE, D]
-            v_full = torch.cat([v_flat, v_tail], dim=2)      # [n_kv, 1, total_L+FP8_BLOCK_SIZE, D]
+            v_full = torch.cat([v_flat.to(compute_dtype), v_tail.to(compute_dtype)], dim=2)
         else:
             v_full = v_flat
 
@@ -582,19 +658,21 @@ def allocate_fp8_kv_cache_tensors(
 ):
     """Allocate FP8 KV cache tensors.
 
-    **Option 1 returns a 4-tuple:**
-    ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``
+    **Option 1 returns a 5-tuple:**
+    ``(key_cache, key_scale_cache, value_cache, value_scale_cache,
+    (key_tail_buf, value_tail_buf))``
 
     **Option 2 returns a 3-tuple:**
     ``(key_cache, key_scale_cache, value_cache)``
 
     Option 1 shapes (Spyre):
-      ``key_cache``       ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT
-      ``key_scale_cache`` ``[NUM_BLOCKS, 1, 1, 1]``                 compute dtype
-      ``value_cache``     ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype
-      ``key_tail_buf``    ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype
-      ``value_tail_buf``  ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype
-      (both tail buffers are the 4th element, packed as a 2-tuple)
+      ``key_cache``         ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT
+      ``key_scale_cache``   ``[NUM_BLOCKS, 1, 1, 1]``                  compute dtype
+      ``value_cache``       ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]``  FP8 QFP8CH
+      ``value_scale_cache`` ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, 64]`` compute dtype
+      ``key_tail_buf``      ``[B, n_kv, FP8_BLOCK_SIZE, D]``           compute dtype
+      ``value_tail_buf``    ``[B, n_kv, FP8_BLOCK_SIZE, D]``           compute dtype
+      (tail buffers are the 5th element, packed as a 2-tuple)
 
     Option 2 shapes:
       ``key_cache``       ``[B, n_kv, L, D]`` FP8 QFP8CH
@@ -638,9 +716,17 @@ def allocate_fp8_kv_cache_tensors(
             (NUM_BLOCKS, 1, 1, 1), dtype=compute_dtype, device=device
         )
 
-        # value_cache: [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D] DL16 token-major.
+        # value_cache: [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D] FP8 QFP8CH token-major.
+        # Allocated as CPU zeros then moved — avoids RuntimeOperationFill on QFP8CH.
         shape_v = (NUM_BLOCKS, FP8_BLOCK_SIZE, num_kv_heads, head_dim)
-        value_cache = torch.zeros(shape_v, dtype=compute_dtype, device=device)
+        value_cache = torch.zeros(shape_v, dtype=FP8_DTYPE).to(device)
+
+        # value_scale_cache: [NUM_BLOCKS, 1, 1, 1] — per-block scalar, same shape
+        # as key_scale_cache.  One amax scalar per committed V block.
+        # Matches ScaledPagedAttnStore reference design.
+        value_scale_cache = torch.zeros(
+            (NUM_BLOCKS, 1, 1, 1), dtype=compute_dtype, device=device
+        )
 
         # Tail buffers: [B, n_kv, FP8_BLOCK_SIZE, D] DL16 — decode staging.
         # Fixed-shape: always FP8_BLOCK_SIZE slots regardless of how many are filled.
@@ -649,7 +735,7 @@ def allocate_fp8_kv_cache_tensors(
         key_tail_buf = torch.zeros(shape_tail, dtype=compute_dtype, device=device)
         value_tail_buf = torch.zeros(shape_tail, dtype=compute_dtype, device=device)
 
-        return key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf)
+        return key_cache, key_scale_cache, value_cache, value_scale_cache, (key_tail_buf, value_tail_buf)
 
     else:
         # ── Option 2 / CPU: standard [B, n_kv, L, D] layout ──────────────

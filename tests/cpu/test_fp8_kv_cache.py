@@ -408,20 +408,23 @@ class TestAllocationHelpers:
         assert vc.shape == (B, n_kv, L, D)
 
     def test_allocate_fp8_kv_cache_tensors_shapes_option1_cpu(self):
-        """option=1 returns a 4-tuple with block-layout shapes (even on CPU).
+        """option=1 returns a 5-tuple with block-layout shapes (even on CPU).
 
         Option 1 allocation always uses the block layout; the fill/attend CPU
         path falls back to option=2 behaviour, but the tensor shapes returned
         by ``allocate_fp8_kv_cache_tensors`` match the Spyre shapes.
 
-        Returned tuple: ``(key_cache, key_scale_cache, value_cache, (ktail, vtail))``
+        Returned tuple:
+          ``(key_cache, key_scale_cache, value_cache, value_scale_cache,
+          (ktail, vtail))``
 
         Shapes:
-            key_cache        [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]  FP8
-            key_scale_cache  [NUM_BLOCKS, 1, 1, 1]                  compute dtype
-            value_cache      [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]  compute dtype
-            key_tail_buf     [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
-            value_tail_buf   [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
+            key_cache         [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]  FP8
+            key_scale_cache   [NUM_BLOCKS, 1, 1, 1]                  compute dtype
+            value_cache       [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]  FP8
+            value_scale_cache [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, 64] compute dtype
+            key_tail_buf      [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
+            value_tail_buf    [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
         """
         B, n_kv, D = 1, 8, 128
         L = 256  # must be a multiple of FP8_BLOCK_SIZE (128)
@@ -430,27 +433,29 @@ class TestAllocationHelpers:
         result = allocate_fp8_kv_cache_tensors(
             B, n_kv, L, D, torch.bfloat16, device="cpu", option=1,
         )
-        assert len(result) == 4, f"option=1 should return 4-tuple, got {len(result)}"
-        kc, ksc, vc, (ktail, vtail) = result
+        assert len(result) == 5, f"option=1 should return 5-tuple, got {len(result)}"
+        kc, ksc, vc, vsc, (ktail, vtail) = result
 
         # Block cache shapes
         assert kc.shape == (NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE), kc.shape
         assert ksc.shape == (NUM_BLOCKS, 1, 1, 1), ksc.shape
         assert vc.shape == (NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D), vc.shape
+        assert vsc.shape == (NUM_BLOCKS, 1, 1, 1), vsc.shape
         # Tail buffer shapes
         assert ktail.shape == (B, n_kv, FP8_BLOCK_SIZE, D), ktail.shape
         assert vtail.shape == (B, n_kv, FP8_BLOCK_SIZE, D), vtail.shape
 
     def test_allocate_fp8_kv_cache_tensors_option1_dtypes(self):
-        """option=1 key cache is FP8; scale, V and tail buffers are compute dtype."""
+        """option=1 key+value caches are FP8; scales and tail bufs are compute dtype."""
         B, n_kv, D = 1, 4, 128
         L = 128  # 1 block
-        kc, ksc, vc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
+        kc, ksc, vc, vsc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
             B, n_kv, L, D, torch.bfloat16, device="cpu", option=1,
         )
         assert kc.dtype == FP8_DTYPE
         assert ksc.dtype == torch.bfloat16
-        assert vc.dtype == torch.bfloat16
+        assert vc.dtype == FP8_DTYPE
+        assert vsc.dtype == torch.bfloat16
         assert ktail.dtype == torch.bfloat16
         assert vtail.dtype == torch.bfloat16
 
@@ -458,12 +463,13 @@ class TestAllocationHelpers:
         """option=1 — all returned tensors must be zero-initialised."""
         B, n_kv, D = 1, 4, 128
         L = 128
-        kc, ksc, vc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
+        kc, ksc, vc, vsc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
             B, n_kv, L, D, torch.bfloat16, device="cpu", option=1,
         )
         assert not kc.to(torch.float32).any()
         assert not ksc.any()
-        assert not vc.any()
+        assert not vc.to(torch.float32).any()
+        assert not vsc.any()
         assert not ktail.any()
         assert not vtail.any()
 
@@ -501,15 +507,16 @@ class TestAllocationHelpers:
             config = _Cfg()
 
         # max_cache_len=256 is a multiple of FP8_BLOCK_SIZE (128) — required for option=1
-        # Option 1 returns a 4-tuple; option 2 returns a 3-tuple.
-        kcs, kscs, vcs, tail_bufs_list = allocate_fp8_kv_caches(
+        # Option 1 returns a 5-tuple; option 2 returns a 3-tuple.
+        kcs, kscs, vcs, vscs, tail_bufs_list = allocate_fp8_kv_caches(
             _Model(), 1, 256, torch.bfloat16, device="cpu", option=1,
         )
-        assert len(kcs) == len(kscs) == len(vcs) == len(tail_bufs_list) == 3
-        for kc, ksc, vc, (ktail, vtail) in zip(kcs, kscs, vcs, tail_bufs_list):
+        assert len(kcs) == len(kscs) == len(vcs) == len(vscs) == len(tail_bufs_list) == 3
+        for kc, ksc, vc, vsc, (ktail, vtail) in zip(kcs, kscs, vcs, vscs, tail_bufs_list):
             assert kc.dtype == FP8_DTYPE
             assert ksc.dtype == torch.bfloat16
-            assert vc.dtype == torch.bfloat16
+            assert vc.dtype == FP8_DTYPE
+            assert vsc.dtype == torch.bfloat16
             assert ktail.dtype == torch.bfloat16
             assert vtail.dtype == torch.bfloat16
         # Option 2 still returns a 3-tuple
@@ -692,7 +699,7 @@ class TestOpt1PreAttnDecodeWiring:
         orig_update_tail = _kv.fp8_kv_cache_update_tail
         try:
             # Return caches unchanged — we only want to verify dispatch, not fill correctness.
-            _kv.fp8_kv_cache_update = lambda k, v, kc, ksc, vc, idx, *, option: (
+            _kv.fp8_kv_cache_update = lambda k, v, kc, ksc, vc, idx, *, option, value_scale_cache=None: (
                 calls.append("update"), (kc, ksc, vc)
             )[1]
             _kv.fp8_kv_cache_update_tail = lambda *a, **kw: calls.append("tail")
@@ -702,7 +709,7 @@ class TestOpt1PreAttnDecodeWiring:
             S = FP8_BLOCK_SIZE  # 128 — full block, prefill path
             hs = torch.zeros(B, S, hidden, dtype=torch.bfloat16)
             freqs = torch.zeros(B, S, 2, 2, D // 2, dtype=torch.bfloat16)
-            kc, ksc, vc, _ = allocate_fp8_kv_cache_tensors(
+            kc, ksc, vc, vsc, _ = allocate_fp8_kv_cache_tensors(
                 B, n_kv, S * 2, D, torch.bfloat16, device="cpu", option=1,
             )
             cache_idx = torch.arange(0, 1, dtype=torch.int32)
@@ -735,7 +742,7 @@ class TestOpt1PreAttnDecodeWiring:
             S = 1  # decode
             hs = torch.zeros(B, S, hidden, dtype=torch.bfloat16)
             freqs = torch.zeros(B, S, 2, 2, D // 2, dtype=torch.bfloat16)
-            kc, ksc, vc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
+            kc, ksc, vc, vsc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
                 B, n_kv, FP8_BLOCK_SIZE * 2, D, torch.bfloat16, device="cpu", option=1,
             )
             cache_idx = torch.arange(0, 1, dtype=torch.int32)
@@ -805,7 +812,7 @@ class TestGenerateOpt1TailLogic:
         import hf_adapters.fp8_kv_cache as _kv
         orig_flush = _kv.fp8_kv_cache_flush_tail
 
-        def _mock_flush(ktail, vtail, kc, ksc, vc, block_idx):
+        def _mock_flush(ktail, vtail, kc, ksc, vc, block_idx, *, value_scale_cache=None):
             flush_calls.append(block_idx)
             # Don't actually run Spyre ops on CPU
 
@@ -816,7 +823,7 @@ class TestGenerateOpt1TailLogic:
             MAX_CACHE = FP8_BLOCK_SIZE * 4  # 4 blocks
             PADDED_LEN = FP8_BLOCK_SIZE     # prefill filled 1 block
 
-            kcs, kscs, vcs, tail_bufs_list = allocate_fp8_kv_caches(
+            kcs, kscs, vcs, vscs, tail_bufs_list = allocate_fp8_kv_caches(
                 type("M", (), {"config": type("C", (), {
                     "num_hidden_layers": N_LAYERS,
                     "num_key_value_heads": n_kv,
@@ -870,7 +877,7 @@ class TestGenerateOpt1TailLogic:
             N_LAYERS = 1
             MAX_CACHE = FP8_BLOCK_SIZE * 2
 
-            kcs, kscs, vcs, tail_bufs_list = allocate_fp8_kv_caches(
+            kcs, kscs, vcs, vscs, tail_bufs_list = allocate_fp8_kv_caches(
                 type("M", (), {"config": type("C", (), {
                     "num_hidden_layers": N_LAYERS,
                     "num_key_value_heads": n_kv,

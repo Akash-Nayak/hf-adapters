@@ -57,6 +57,7 @@ def _run_backbone_forward(
     value_tail_bufs=None,
     block_indices_list=None,
     fp8_tail_pos=None,
+    value_scale_caches=None,
 ):
     """Granite 3.3 backbone: embedding * multiplier, blocks, norm.
 
@@ -64,8 +65,8 @@ def _run_backbone_forward(
     block receives the extra per-token K scale cache and returns it updated.
 
     For Option 1 FP8 KV cache, ``key_tail_bufs``, ``value_tail_bufs``,
-    ``block_indices_list``, and ``fp8_tail_pos`` are additionally threaded
-    through each block so the decode tail buffer is read and written correctly.
+    ``block_indices_list``, ``fp8_tail_pos``, and ``value_scale_caches`` are
+    additionally threaded through each block.
     """
     backbone = get_backbone(model)
     h = backbone.embed_tokens(input_ids)
@@ -97,7 +98,7 @@ def _run_backbone_forward(
                 cache_index,
             )
     else:
-        # FP8 KV cache — Option 1 (block layout + DL16 tail)
+        # FP8 KV cache — Option 1 (block layout + DL16 tail + FP8 V)
         for i, compiled_block in enumerate(model._spyre_compiled_blocks):
             h, key_caches[i], key_scale_caches[i], value_caches[i] = compiled_block(
                 h,
@@ -111,6 +112,7 @@ def _run_backbone_forward(
                 value_tail_buf=value_tail_bufs[i],
                 block_indices=block_indices_list[i],
                 fp8_tail_pos=fp8_tail_pos,
+                value_scale_cache=value_scale_caches[i] if value_scale_caches else None,
             )
 
     h = model._spyre_compiled_norm(h)
@@ -130,6 +132,7 @@ def _run_forward(
     value_tail_bufs=None,
     block_indices_list=None,
     fp8_tail_pos=None,
+    value_scale_caches=None,
 ):
     """Granite 3.3 causal-LM forward: backbone + head / scaling."""
     h = _run_backbone_forward(
@@ -145,6 +148,7 @@ def _run_forward(
         value_tail_bufs=value_tail_bufs,
         block_indices_list=block_indices_list,
         fp8_tail_pos=fp8_tail_pos,
+        value_scale_caches=value_scale_caches,
     )
     logits = model.lm_head(h)
     return logits / text_config(model.config).logits_scaling

@@ -362,11 +362,16 @@ def test_fp8_attn_core_decode_accuracy(dtype):
 
 
 class _UpdateOpt1(torch.nn.Module):
-    """Compiled prefill cache update — option=1 (block scatter QFP8WT fill)."""
-    def forward(self, k, v, key_cache, key_scale_cache, value_cache, cache_index):
+    """Compiled prefill cache update — option=1 (block scatter QFP8WT fill + FP8 V).
+
+    Accepts value_scale_cache [NUM_BLOCKS, 1, 1, 1] and scatters one per-block
+    scalar into it — same tiny shape as key_scale_cache, no stick-alignment issues.
+    """
+    def forward(self, k, v, key_cache, key_scale_cache, value_cache, value_scale_cache, cache_index):
         return fp8_kv_cache_update(
             k, v, key_cache, key_scale_cache, value_cache, cache_index,
             option=1,
+            value_scale_cache=value_scale_cache,
         )
 
 
@@ -390,6 +395,7 @@ class _AttendOpt1(torch.nn.Module):
         key_tail_buf,
         value_tail_buf,
         block_indices,
+        value_scale_cache=None,
         attn_mask=None,
     ):
         return fp8_attn_core(
@@ -399,6 +405,7 @@ class _AttendOpt1(torch.nn.Module):
             key_tail_buf=key_tail_buf,
             value_tail_buf=value_tail_buf,
             block_indices=block_indices,
+            value_scale_cache=value_scale_cache,
         )
 
 
@@ -512,79 +519,81 @@ class _FillAndAttendOpt1GQA(torch.nn.Module):
 
 
 def test_fp8_opt1_allocation():
-    """Option 1 allocate: 4-tuple with correct block-layout shapes on Spyre.
+    """Option 1 allocate: 5-tuple with correct block-layout shapes on Spyre.
 
     Verifies:
-      key_cache        [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]  FP8
-      key_scale_cache  [NUM_BLOCKS, 1, 1, 1]                  compute dtype
-      value_cache      [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]  compute dtype
-      key_tail_buf     [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
-      value_tail_buf   [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
+      key_cache         [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]  FP8
+      key_scale_cache   [NUM_BLOCKS, 1, 1, 1]                  compute dtype
+      value_cache       [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]  FP8
+      value_scale_cache [NUM_BLOCKS, 1, 1, 1]                  compute dtype
+      key_tail_buf      [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
+      value_tail_buf    [B, n_kv, FP8_BLOCK_SIZE, D]           compute dtype
     """
     dtype = torch.bfloat16
     result = allocate_fp8_kv_cache_tensors(
         B, N_KV, MAX_CACHE_LEN, HEAD_DIM, dtype, device="spyre", option=1,
     )
-    assert len(result) == 4, f"option=1 should return 4-tuple, got {len(result)}"
-    kc, ksc, vc, (ktail, vtail) = result
+    assert len(result) == 5, f"option=1 should return 5-tuple, got {len(result)}"
+    kc, ksc, vc, vsc, (ktail, vtail) = result
 
     assert kc.shape == (NUM_BLOCKS, N_KV, HEAD_DIM, FP8_BLOCK_SIZE), kc.shape
     assert ksc.shape == (NUM_BLOCKS, 1, 1, 1), ksc.shape
     assert vc.shape == (NUM_BLOCKS, FP8_BLOCK_SIZE, N_KV, HEAD_DIM), vc.shape
+    assert vsc.shape == (NUM_BLOCKS, 1, 1, 1), vsc.shape
     assert ktail.shape == (B, N_KV, FP8_BLOCK_SIZE, HEAD_DIM), ktail.shape
     assert vtail.shape == (B, N_KV, FP8_BLOCK_SIZE, HEAD_DIM), vtail.shape
 
     assert kc.dtype == FP8_DTYPE
     assert ksc.dtype == dtype
-    assert vc.dtype == dtype
+    assert vc.dtype == FP8_DTYPE
+    assert vsc.dtype == dtype
     assert ktail.dtype == dtype
     assert vtail.dtype == dtype
 
 
 def test_fp8_opt1_prefill_fill_compiled():
-    """Option 1 prefill fill: compiled block scatter writes non-zero FP8 K.
+    """Option 1 prefill fill: compiled block scatter writes non-zero FP8 K and FP8 V.
 
     Fills PREFILL_LEN (= 1 block × FP8_BLOCK_SIZE) tokens via option=1.
     Checks:
       * key_cache is FP8 and non-zero at the written block.
       * key_scale_cache is positive at the written block.
-      * value_cache matches the original V exactly at the written block.
+      * value_cache is FP8 and non-zero at the written block.
+      * value_scale_cache (per-block scalar [NUM_BLOCKS, 1, 1, 1]) is positive after scatter.
     """
     torch.manual_seed(0)
     dtype = torch.bfloat16
 
-    kc, ksc, vc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
+    kc, ksc, vc, vsc, (ktail, vtail) = allocate_fp8_kv_cache_tensors(
         B, N_KV, MAX_CACHE_LEN, HEAD_DIM, dtype, device="spyre", option=1,
     )
 
     k = _rand(dtype, B, N_KV, PREFILL_LEN, HEAD_DIM).to("spyre")
     v = _rand(dtype, B, N_KV, PREFILL_LEN, HEAD_DIM).to("spyre")
     # Option 1: pass block indices (int32), NOT token indices.
-    # Derived eagerly outside torch.compile to avoid floordiv unimplemented op.
-    # PREFILL_LEN = NUM_PREFILL_BLOCKS * FP8_BLOCK_SIZE = 1 block starting at block 0.
     idx = torch.arange(0, NUM_PREFILL_BLOCKS, dtype=torch.int32).to("spyre")
 
     compiled = torch.compile(_UpdateOpt1(), dynamic=False)
     with torch.no_grad():
-        kc_out, ksc_out, vc_out = compiled(k, v, kc, ksc, vc, idx)
+        kc_out, ksc_out, vc_out = compiled(k, v, kc, ksc, vc, vsc, idx)
 
     # Key cache must be FP8 and non-zero at block 0
     assert kc_out.dtype == FP8_DTYPE
     k_block0 = kc_out[0].to("cpu").to(torch.float32)  # [n_kv, D, FP8_BLOCK_SIZE]
     assert k_block0.abs().sum().item() > 0, "key cache block 0 is all-zero after prefill"
 
-    # Scale at block 0 must be positive
+    # Key scale at block 0 must be positive
     ksc_b0 = ksc_out[0].to("cpu")  # [1, 1, 1]
     assert (ksc_b0 > 0).all(), "key scale cache has non-positive values at block 0"
 
-    # Value at block 0 must match V exactly
-    # vc shape: [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]
-    # v shape: [B, n_kv, PREFILL_LEN, D]; block 0 = positions 0..FP8_BLOCK_SIZE-1
-    v_block0 = vc_out[0].to("cpu")  # [FP8_BLOCK_SIZE, n_kv, D]
-    # Transpose to [n_kv, FP8_BLOCK_SIZE, D] for comparison with v[0]
-    v_block0_t = v_block0.permute(1, 0, 2)  # [n_kv, FP8_BLOCK_SIZE, D]
-    v_ref = v.to("cpu")[0]                  # [n_kv, PREFILL_LEN, D]
-    torch.testing.assert_close(v_block0_t, v_ref, rtol=0, atol=0)
+    # Value cache must be FP8 and non-zero at block 0 (V is now quantized)
+    assert vc_out.dtype == FP8_DTYPE
+    v_block0 = vc_out[0].to("cpu").to(torch.float32)  # [FP8_BLOCK_SIZE, n_kv, D]
+    assert v_block0.abs().sum().item() > 0, "value cache block 0 is all-zero after prefill"
+
+    # Value scale cache at block 0 must be positive scalar ([NUM_BLOCKS, 1, 1, 1])
+    vsc_b0 = vsc[0].to("cpu")  # [1, 1, 1]
+    assert (vsc_b0 > 0).all(), "value scale cache has non-positive values at block 0"
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
