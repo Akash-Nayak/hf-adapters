@@ -12,85 +12,156 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP8 KV cache for Spyre: K stored as E4M3, QK^T in FP8 (Option 1).
+"""FP8 KV cache for Spyre — two option variants selectable at runtime.
 
-Storage strategy:
+Both options store K as FP8 E4M3 and V unquantized in the compute dtype.
+They differ only in the QK^T matmul path:
 
-  1. K projection output is DL16.  Compute a per-token scale for K and store
-     K as FP8 E4M3 in the cache; also store the per-token K scale alongside
-     the quantized K tensor as a compact **3D** ``[B, n_kv, L]`` tensor (one
-     scalar per token per KV head).  V is stored unchanged in compute dtype.
+  **Option 1 — direct-FP8-matmul** (target; block-scatter layout)
+    K is written in **paged block layout** ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]``
+    (transposed, D-inner) using ``index_copy_(0, block_idx, ...)`` — a full-stick
+    scatter.  Consumed by ``spyre.scaled_bmm`` at attention time.  A DL16 tail
+    buffer ``[B, n_kv, FP8_BLOCK_SIZE, D]`` accumulates decode tokens (n=1) that do
+    not yet fill a complete block; it is attended via standard ``torch.matmul``.
+    Q is quantized to FP8 per-token before ``scaled_bmm``.
 
-  2. At attention time (Option 1 — active):
-     Quantize Q to FP8 per-token, run QK^T entirely in FP8 via
-     ``spyre.scaled_bmm`` (FP8 × FP8 → FP16), then apply scale compensation
-     ``scores × q_scale × k_scale × (1/√D)``.  No dequantize step for K.
+  **Option 2 — dequantize-K** (fallback; works on device today)
+    K is written as QFP8CH (standard, L-inner) at fill time.  At attention
+    time K is dequantized back to DL16 and the standard ``torch.matmul`` path
+    is used.  Gives the same 2× K cache memory saving with no QK^T speedup.
 
-  Option 2 (dequantize K → DL16, run DL16 QK^T via ``torch.matmul``) is
-  preserved as a fallback below the active block.
+Select via the ``option`` argument to :func:`fp8_kv_cache_update` and
+:func:`fp8_attn_core`, or pass ``fp8_kv_opt`` to
+``prepare_for_spyre(model, fp8_kv_cache=True, fp8_kv_opt=1)``.
 
-Scale cache memory:
-  Old workaround: ``[B, n_kv, L, 64]`` — break-even (scale = 1× K size).
-  Current:        ``[B, n_kv, L]``     — ~128× smaller than K; true ~2× K saving.
-  The sub-stick scatter fix (``feat/fp8-paged-attention-substick-scatter``,
-  cherry-picked into ``feat/fp8-kv-cache-opt2``) enables the 3D shape by
-  fixing the ``L3DlOpsScheduler`` "no valid candidate" crash that previously
-  blocked it.
+---
 
-V multiply and softmax always run in DL16 — V is NOT quantized in this
-implementation.  Only K is stored FP8; V remains in the compute dtype.
+### Cache tensor shapes
+
+  Option 1 (Spyre):
+    key_cache        ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` float8_e4m3fn
+    key_scale_cache  ``[NUM_BLOCKS, 1, 1, 1]``                 compute dtype  scalar per block
+    value_cache      ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype  token-major
+    key_tail_buf     ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype  decode staging
+
+    ``NUM_BLOCKS = max_cache_len // FP8_BLOCK_SIZE``
+
+    ``allocate_fp8_kv_cache_tensors(option=1)`` returns a **4-tuple**
+    ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``.
+
+  Option 2 (Spyre + CPU):
+    key_cache        ``[B, n_kv, L, D]`` float8_e4m3fn
+    key_scale_cache  ``[B, n_kv, L, 1]`` compute dtype  — per-token scale (trailing dim = 1)
+    value_cache      ``[B, n_kv, L, D]`` compute dtype
+
+    ``allocate_fp8_kv_cache_tensors(option=2)`` returns a **3-tuple**
+    ``(key_cache, key_scale_cache, value_cache)``.
+
+  On CPU (both options fall back to the Option 2 CPU path):
+    key_cache        ``[B, n_kv, L, D]`` float8_e4m3fn
+    key_scale_cache  ``[B, n_kv, L, 1]`` compute dtype
+    value_cache      ``[B, n_kv, L, D]`` compute dtype
+
+---
+
+### Fill path — ``fp8_kv_cache_update``
+
+  Option 1 (Spyre) — **prefill** (``n % FP8_BLOCK_SIZE == 0``):
+    ``cache_index`` must be pre-computed **block** indices (int32) outside ``torch.compile``.
+    1. Cast K to FP16; permute ``[B, n_kv, n, D]`` → ``[n_kv, D, n]``.
+    2. ``quantscalepertokenfp8`` → scalar amax → ``quantize_weight_fp8_with_scale``.
+    3. Reshape K FP8 to ``[num_b, n_kv, D, FP8_BLOCK_SIZE]``.
+    4. ``key_cache.index_copy_(0, block_idx, ...)`` — full-stick scatter.
+    5. ``key_scale_cache.index_copy_(0, block_idx, sk.reshape(num_b, 1, 1, 1))``.
+    6. V ``[B, n_kv, n, D]`` → ``[num_b, FP8_BLOCK_SIZE, n_kv, D]`` → scatter dim 0.
+
+  Option 1 (Spyre) — **decode** (``n < FP8_BLOCK_SIZE``, typically ``n=1``):
+    Writes K and V into ``key_tail_buf`` / ``value_tail_buf`` at the tail position
+    computed by the caller.  **Called eagerly (outside torch.compile)**; the tail
+    buffers are fixed-shape tensors passed as-is to ``fp8_attn_core``.
+    When the tail is full (``tail_pos == FP8_BLOCK_SIZE``), the caller flushes it
+    by calling ``fp8_kv_cache_flush_tail``.
+
+  Option 2 (Spyre):
+    1. Compute scale: ``quantscalepertokenfp8`` → ``[B, n_kv, n, 1]`` fp16.
+    2. Encode to QFP8CH via ``quantize_fp8_with_scale``.
+    3. Scatter into ``key_cache[:, :, cache_index, :]`` (dim 2 = position dim).
+    4. Scatter scale into ``key_scale_cache[:, :, cache_index, :]`` (dim 2).
+
+  Option 2 (CPU):
+    Same scale/quantize logic but using ``_quantize_fp8_per_token`` (CPU only).
+    FP8 ``index_copy_`` not supported on CPU — reinterprets as uint8.
+
+  V is always scattered unchanged into ``value_cache``.
+
+---
+
+### Decode path — ``fp8_attn_core``
+
+  Option 1 (Spyre):
+    1. Quantize Q per-token to QFP8CH; reshape to ``[n_kv, kv_repeat, S, D]``.
+    2. For each committed block: ``spyre.scaled_bmm(q_fp8, k_block)`` → scores;
+       apply per-token scale compensation.
+    3. Concatenate committed block scores; add DL16 tail scores (``torch.matmul``).
+    4. Apply mask, softmax.
+    5. AV: reshape committed V to ``[n_kv, 1, total_L, D]``; cat tail V; matmul.
+    6. Reshape output back to ``[B, H, S, D]``.
+
+  Option 2 (Spyre + CPU):
+    1. Dequantize K from ``[B, n_kv, L, D]`` to DL16.
+    2. Expand from n_kv → H via ``repeat_interleave``.
+    3. ``torch.matmul(Q, K^T)`` → standard DL16 QK^T.
+    4. Softmax + AV multiply (V is DL16).
+
+---
+
+### Why block scatter (Option 1) avoids partial-stick writes
+
+  Each ``index_copy_(0, block_idx, src)`` call writes ``src`` of shape
+  ``[num_b, n_kv, D, FP8_BLOCK_SIZE]``.  The innermost dimension
+  ``FP8_BLOCK_SIZE = 128`` is exactly one FP8 stick (128 elements).
+  Scattering on dim 0 (the block dimension) copies whole contiguous sticks.
+
+  The previous ``[B, n_kv, D, L]`` + ``index_copy_(3, token_idx)`` wrote
+  1 token = 1 position inside a 128-element stick — a partial-stick write
+  that the hardware does not support.
 """
 
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 FP8_DTYPE = torch.float8_e4m3fn
-FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
-SCALE_EPS = 1e-4  # prevents zero scale for all-zero tokens
+FP8_MAX = 448.0          # torch.finfo(torch.float8_e4m3fn).max
+SCALE_EPS = 1e-4         # prevents zero scale for all-zero tokens
+FP8_BLOCK_SIZE = 128     # FP8 stick size in elements; must equal head_dim for Granite
 
 
 # ---------------------------------------------------------------------------
-# Per-token FP8 quantization helpers (CPU + Spyre)
+# Per-token FP8 quantization helper (CPU path only)
 # ---------------------------------------------------------------------------
 
 
 def _quantize_fp8_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``x`` to FP8 E4M3 with a per-token scale.
+    """Quantize ``x`` to FP8 E4M3 with a per-token scale (CPU only).
+
+    On Spyre, use ``quantize_fp8_with_scale`` / ``quantize_weight_fp8_with_scale``
+    directly so the compiler can fuse and lower them to hardware ops.
 
     Args:
-        x: ``[B, H, S, D]`` or ``[B*H, S, D]`` in the compute dtype.
+        x: any shape in compute dtype.
 
     Returns:
-        ``(xq, scale)`` where ``xq`` is FP8 E4M3, same shape as ``x``,
-        and ``scale`` is ``[..., S, 1]`` — one scalar per token, kept as a
-        size-1 trailing dim for broadcasting against ``[..., S, D]``.
-        The 3D key_scale_cache stores these scalars compactly as ``[B, n_kv, L]``.
+        ``(xq, scale)`` where ``xq`` is FP8 E4M3 and ``scale`` is ``[..., 1]``
+        (one scalar per token, keepdim=True on the last dim).
     """
-    if x.device.type == "spyre":
-        # Use abs().amax() idiom (same as FP8Linear) to avoid the
-        # quantscalepertokenfp8 DDL bug.  keepdim=True → [..., S, 1].
-        scale = (
-            (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX))
-            .clamp(min=SCALE_EPS)
-            .clone()
-        )
-        xq = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
-    else:
-        # CPU reference path
-        scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
-            min=SCALE_EPS
-        )
-        xq = (x * scale.reciprocal()).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(min=SCALE_EPS)
+    xq = (x * scale.reciprocal()).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
     return xq, scale
 
 
 # ---------------------------------------------------------------------------
-# FP8 KV cache update
+# FP8 KV cache update — fill path
 # ---------------------------------------------------------------------------
 
 
@@ -101,47 +172,184 @@ def fp8_kv_cache_update(
     key_scale_cache: torch.Tensor,
     value_cache: torch.Tensor,
     cache_index: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Write K (as FP8) and V (as compute dtype) into their caches.
+    *,
+    option: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Write K (FP8) and V into the **committed block caches** at the given positions.
 
-    K is quantized to FP8 per-token before the scatter, and the per-token
-    scale is written into ``key_scale_cache``.  V is stored unquantized in
-    the compute dtype.
+    For Option 1 this handles the **prefill path only** (``n`` is a multiple of
+    ``FP8_BLOCK_SIZE``).  Decode writes (``n=1``) go through
+    :func:`fp8_kv_cache_update_tail` instead.
 
     Args:
-        k: ``[B, n_kv, n, head_dim]`` — K projection for ``n`` positions.
-        v: ``[B, n_kv, n, head_dim]`` — V projection for ``n`` positions.
-        key_cache: ``[B, n_kv, L, head_dim]`` FP8 E4M3.
-        key_scale_cache: ``[B, n_kv, L]`` compute dtype — one scalar per token
-            per KV head.  The sub-stick scatter fix in ``superdsc.py`` enables
-            this compact 3D shape to compile on Spyre.
-        value_cache: ``[B, n_kv, L, head_dim]`` compute dtype.
-        cache_index: ``[n]`` int64 destination positions.
+        k: ``[B, n_kv, n, D]`` K projection for ``n`` new positions.
+        v: ``[B, n_kv, n, D]`` V projection for ``n`` new positions.
+        key_cache:
+            Option 1 Spyre: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT.
+            Option 2 / CPU: ``[B, n_kv, L, D]`` FP8 QFP8CH.
+        key_scale_cache:
+            Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype scalar per block.
+            Option 2: ``[B, n_kv, L, 1]`` compute dtype per-token scale.
+        value_cache:
+            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+            Option 2: ``[B, n_kv, L, D]`` compute dtype.
+        cache_index:
+            **Option 1**: ``[num_b]`` int32 **block** indices
+            (e.g. ``torch.arange(start_block, start_block + num_b, dtype=torch.int32)``).
+            Must be pre-computed **outside** ``torch.compile`` — deriving block
+            indices inside the graph via ``//`` emits an unsupported ``floordiv`` op.
+            **Option 2 / CPU**: ``[n]`` int64 **token** positions
+            (``arange(start, start+n)``).
+        option: 1 = block-scatter QFP8WT fill + ``scaled_bmm`` at attend.
+                2 = QFP8CH fill + dequantize-K at attend.
 
     Returns:
-        Updated ``(key_cache, key_scale_cache, value_cache)`` plus the
-        quantized ``k_fp8`` that callers need for QK^T (avoids re-quantizing).
+        Updated ``(key_cache, key_scale_cache, value_cache)``.
     """
-    k_fp8, k_scale = _quantize_fp8_per_token(k)
-    # k_fp8:  [B, n_kv, n, D]
-    # k_scale: [B, n_kv, n, 1] — squeeze the trailing size-1 dim before scatter
-    #   so the source shape matches the 3D key_scale_cache [B, n_kv, L].
-    k_scale_3d = k_scale.squeeze(-1)  # [B, n_kv, n]
+    on_spyre = k.device.type == "spyre"
+    B, n_kv, n, D = k.shape
 
-    if key_cache.device.type == "cpu":
-        # CPU PyTorch does not implement index_copy_ for FP8 dtypes.
-        # Work around by reinterpreting as uint8, scattering bytes, then viewing
-        # back as FP8.  The bit pattern is preserved exactly.
-        key_cache.view(torch.uint8).index_copy_(2, cache_index, k_fp8.view(torch.uint8))
-    else:
+    if option == 1 and on_spyre:
+        # ── Option 1 prefill fill: block scatter on dim 0 ─────────────────
+        # n must be a whole number of FP8 blocks; decode tokens use
+        # fp8_kv_cache_update_tail instead.
+        assert n % FP8_BLOCK_SIZE == 0, (
+            f"Option 1 fp8_kv_cache_update requires n to be a multiple of "
+            f"FP8_BLOCK_SIZE={FP8_BLOCK_SIZE}, got n={n}. "
+            "Decode tokens (n=1) should use fp8_kv_cache_update_tail."
+        )
+        num_b = n // FP8_BLOCK_SIZE
+
+        # cache_index is already block indices for Option 1 — pre-computed by
+        # the caller outside torch.compile to avoid an unsupported floordiv op.
+        block_idx = cache_index  # [num_b] int32
+
+        # K: [B, n_kv, n, D] → drop B (B=1 always for Granite) → [n_kv, D, n] FP16.
+        # .contiguous() ensures the N-inner stride layout required by
+        # quantize_weight_fp8_with_scale.
+        k_fp16 = k[0].to(torch.float16)                     # [n_kv, n, D]
+        k_perm = k_fp16.permute(0, 2, 1).contiguous()       # [n_kv, D, n]
+
+        # Per-tensor conservative scale: max of per-token scales across the block.
+        # quantize_weight_fp8_with_scale requires a scalar or broadcastable scale.
+        sk = torch.ops.spyre.quantscalepertokenfp8(k_perm).amax()  # scalar fp16
+        k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k_perm, sk)
+
+        # Reshape into blocks: [n_kv, D, n] → [num_b, n_kv, D, FP8_BLOCK_SIZE]
+        k_blocked = (
+            k_fp8.reshape(n_kv, D, num_b, FP8_BLOCK_SIZE)
+            .permute(2, 0, 1, 3)
+            .contiguous()
+        )  # [num_b, n_kv, D, FP8_BLOCK_SIZE]
+
+        # Full-stick scatter on dim 0.
+        key_cache.index_copy_(0, block_idx, k_blocked)
+        key_scale_cache.index_copy_(
+            0, block_idx, sk.reshape(1, 1, 1, 1).expand(num_b, 1, 1, 1).contiguous()
+        )
+
+        # V: [B, n_kv, n, D] → [num_b, FP8_BLOCK_SIZE, n_kv, D]
+        v_blocked = v[0].permute(1, 0, 2).reshape(num_b, FP8_BLOCK_SIZE, n_kv, D)
+        value_cache.index_copy_(0, block_idx, v_blocked)
+
+    elif on_spyre:
+        # ── Option 2 fill on Spyre: write K as QFP8CH ─────────────────────
+        k_scale = (
+            k.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)
+        ).clamp(min=SCALE_EPS)  # [B, n_kv, n, 1]
+        k_fp8 = torch.ops.spyre.quantize_fp8_with_scale(k, k_scale)
+
         key_cache.index_copy_(2, cache_index, k_fp8)
-    # Scatter the compact 3D scale [B, n_kv, n] into the 3D cache [B, n_kv, L].
-    # The sub-stick indirect scatter fix in superdsc.py (feat/fp8-kv-cache-opt2)
-    # handles this shape correctly on Spyre.
-    key_scale_cache.index_copy_(2, cache_index, k_scale_3d)
-    value_cache.index_copy_(2, cache_index, v)
+        key_scale_cache.index_copy_(2, cache_index, k_scale)
+        value_cache.index_copy_(2, cache_index, v)
 
-    return key_cache, key_scale_cache, value_cache, k_fp8, k_scale
+    else:
+        # ── Option 2 fill on CPU (or option==1 CPU fallback) ──────────────
+        k_fp8, k_scale = _quantize_fp8_per_token(k)
+
+        # CPU: FP8 index_copy_ not implemented — reinterpret as uint8.
+        key_cache.view(torch.uint8).index_copy_(
+            2, cache_index, k_fp8.view(torch.uint8)
+        )
+        key_scale_cache.index_copy_(2, cache_index, k_scale)
+        value_cache.index_copy_(2, cache_index, v)
+
+    return key_cache, key_scale_cache, value_cache
+
+
+# ---------------------------------------------------------------------------
+# Option 1 decode tail helpers (called eagerly, outside torch.compile)
+# ---------------------------------------------------------------------------
+
+
+def fp8_kv_cache_update_tail(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    key_tail_buf: torch.Tensor,
+    value_tail_buf: torch.Tensor,
+    tail_pos: int,
+) -> None:
+    """Write one decode token into the DL16 tail buffers (Option 1, in-place).
+
+    Called **eagerly** (outside ``torch.compile``) once per decode step.  The
+    tail buffers are fixed-shape ``[B, n_kv, FP8_BLOCK_SIZE, D]`` tensors; the
+    caller passes ``tail_pos = current_cache_len % FP8_BLOCK_SIZE``.
+
+    When the buffer becomes full (``tail_pos + 1 == FP8_BLOCK_SIZE``), the caller
+    should follow with :func:`fp8_kv_cache_flush_tail`.
+
+    Args:
+        k: ``[B, n_kv, 1, D]`` — single decode K token.
+        v: ``[B, n_kv, 1, D]`` — single decode V token.
+        key_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 staging buffer (mutated).
+        value_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 staging buffer (mutated).
+        tail_pos: slot index within the tail buffer (0 … FP8_BLOCK_SIZE-1).
+    """
+    key_tail_buf[:, :, tail_pos : tail_pos + 1, :] = k
+    value_tail_buf[:, :, tail_pos : tail_pos + 1, :] = v
+
+
+def fp8_kv_cache_flush_tail(
+    key_tail_buf: torch.Tensor,
+    value_tail_buf: torch.Tensor,
+    key_cache: torch.Tensor,
+    key_scale_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_idx: int,
+) -> None:
+    """Flush a full tail buffer into the committed block caches (Option 1, in-place).
+
+    Called **eagerly** when ``tail_pos + 1 == FP8_BLOCK_SIZE``.  After flushing,
+    the caller should zero ``key_tail_buf`` and ``value_tail_buf`` and reset
+    ``tail_pos = 0``.
+
+    Args:
+        key_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 — full tail block.
+        value_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 — full tail block.
+        key_cache: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT.
+        key_scale_cache: ``[NUM_BLOCKS, 1, 1, 1]`` compute dtype.
+        value_cache: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+        block_idx: integer block index to write into.
+    """
+    on_spyre = key_tail_buf.device.type == "spyre"
+    B, n_kv, _, D = key_tail_buf.shape
+    idx = torch.tensor([block_idx], dtype=torch.int32, device=key_tail_buf.device)
+
+    if on_spyre:
+        # K: [B, n_kv, FP8_BLOCK_SIZE, D] → [n_kv, D, FP8_BLOCK_SIZE] FP16
+        k_fp16 = key_tail_buf[0].to(torch.float16)          # [n_kv, FP8_BLOCK_SIZE, D]
+        k_perm = k_fp16.permute(0, 2, 1).contiguous()       # [n_kv, D, FP8_BLOCK_SIZE]
+        sk = torch.ops.spyre.quantscalepertokenfp8(k_perm).amax()
+        k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k_perm, sk)
+        # Unsqueeze to [1, n_kv, D, FP8_BLOCK_SIZE] for dim-0 scatter.
+        key_cache.index_copy_(0, idx, k_fp8.unsqueeze(0))
+        key_scale_cache.index_copy_(0, idx, sk.reshape(1, 1, 1, 1))
+        # V: [B, n_kv, FP8_BLOCK_SIZE, D] → [1, FP8_BLOCK_SIZE, n_kv, D]
+        v_blocked = value_tail_buf[0].permute(1, 0, 2).unsqueeze(0)
+        value_cache.index_copy_(0, idx, v_blocked)
+    else:
+        # Flush is a no-op on CPU — the tail buffer is read directly by fp8_attn_core.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -157,90 +365,191 @@ def fp8_attn_core(
     attn_mask: torch.Tensor | None,
     scaling: float,
     compute_dtype: torch.dtype,
+    *,
+    option: int = 1,
+    key_tail_buf: torch.Tensor | None = None,
+    value_tail_buf: torch.Tensor | None = None,
+    block_indices: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute attention with FP8 K cache; QK^T in FP8 (Option 1).
+    """Compute attention using the FP8 KV cache.
 
-    Quantizes Q per-token to FP8, runs QK^T entirely in FP8 via
-    ``spyre.scaled_bmm`` (FP8 × FP8 → FP16), applies scale compensation, then
-    runs softmax and AV multiply in compute dtype.  No dequantize step for K.
+    Option 1 (Spyre only) — direct-FP8-matmul + DL16 tail:
+      Reshape block cache, quantize Q, ``spyre.scaled_bmm`` for committed tokens.
+      Concatenate tail scores (DL16 ``torch.matmul``) before softmax.
 
-    On CPU (no ``spyre.scaled_bmm``), falls back to Option 2: dequantize K to
-    DL16 and run DL16 QK^T via ``torch.matmul``.
+    Option 2 (Spyre + CPU) — dequantize-K:
+      Dequantize K from QFP8CH to DL16, run standard ``torch.matmul``.
+      Falls back to Option 2 on CPU even when ``option=1``.
 
     Args:
-        q: ``[B, H, S, D]`` query in compute dtype (DL16).
-        key_cache: ``[B, n_kv, L, D]`` FP8 E4M3 key cache.
-        key_scale_cache: ``[B, n_kv, L]`` per-token K scale (one scalar per
-            token per KV head).
-        value_cache: ``[B, n_kv, L, D]`` compute dtype value cache.
-        attn_mask: additive causal mask or None.
-        scaling: attention scale (``1 / sqrt(head_dim)``).
+        q: ``[B, H, S, D]`` query in compute dtype.
+        key_cache:
+            Option 1: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT.
+            Option 2: ``[B, n_kv, L, D]`` FP8 QFP8CH.
+        key_scale_cache:
+            Option 1: ``[NUM_BLOCKS, 1, 1, 1]`` per-block scale.
+            Option 2: ``[B, n_kv, L, 1]`` per-token scale.
+        value_cache:
+            Option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype.
+            Option 2: ``[B, n_kv, L, D]`` compute dtype.
+        attn_mask: additive causal mask of shape ``[B, 1, S, total_L]``
+            where ``total_L = NUM_BLOCKS * FP8_BLOCK_SIZE + FP8_BLOCK_SIZE`` for
+            Option 1 (committed + tail), or ``[B, 1, S, L]`` for Option 2.
+        scaling: ``1 / sqrt(head_dim)``.
         compute_dtype: BF16 or FP16.
+        option: 1 = block-layout ``scaled_bmm`` + DL16 tail.
+                2 = dequantize-K ``torch.matmul``.
+        key_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 decode staging
+            (Option 1 only; pass zeros when no decode tokens yet).
+        value_tail_buf: ``[B, n_kv, FP8_BLOCK_SIZE, D]`` DL16 decode staging
+            (Option 1 only).
+        block_indices: ``[NUM_BLOCKS, 1]`` int32 tensor on the same device as
+            ``key_cache``, containing ``[[0], [1], ..., [NUM_BLOCKS-1]]``.
+            Must be pre-built **outside** ``torch.compile`` and passed in as a
+            graph argument to avoid ``copy_from_d2d`` re-entry on Spyre.
+            When ``None`` (eager / CPU fallback), built automatically.
+        q_scale: ``[n_kv, kv_repeat, S, 1]`` FP16 per-token Q scale, pre-computed
+            outside ``torch.compile`` via
+            ``quantscalepertokenfp8(q_reshaped.to(float16))``.
+            When ``None``, computed eagerly (works for CPU and eager mode; for
+            compiled graphs pass this as a pre-built device tensor argument).
 
     Returns:
         ``[B, H, S, D_v]`` attention output in compute dtype.
     """
     B, H, S, D = q.shape
-    _, n_kv, L, _ = key_cache.shape
-
-    # GQA: KV heads are grouped into Q heads.
-    kv_repeat = H // n_kv
-
-    # Defensive guard: key_scale_cache may have a larger L than key_cache when
-    # SDPA tiling presents key_cache at a sub-extent of max_cache_len.
-    k_scale = key_scale_cache[:, :, :L]  # [B, n_kv, L]
-
     on_spyre = q.device.type == "spyre"
 
-    if on_spyre:
-        # -----------------------------------------------------------------
-        # Option 1 (active on Spyre): FP8 QK^T via spyre.scaled_bmm
-        # -----------------------------------------------------------------
-        # Q: quantize per-token to FP8 QFP8CH.
-        # q: [B, H, S, D] → cast to fp16 first (quantize_fp8_with_scale on fp16)
-        q_fp16 = q.to(torch.float16)
-        q_scale = (
-            q_fp16.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)
-        ).clamp(min=SCALE_EPS)  # [B, H, S, 1]
-        q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_fp16, q_scale)  # [B, H, S, D]
+    if option == 1 and on_spyre:
+        # ── Option 1: FP8 block cache QK^T + DL16 tail ────────────────────
+        # key_cache: [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]
+        NUM_BLOCKS = key_cache.shape[0]
+        n_kv = key_cache.shape[1]
+        kv_repeat = H // n_kv
+        total_L = NUM_BLOCKS * FP8_BLOCK_SIZE  # committed tokens
 
-        # K^T: key_cache [B, n_kv, L, D] → transpose to [B, n_kv, D, L]
-        # GQA expand: unsqueeze head-group dim → [B, n_kv, 1, D, L]
-        # then expand to [B, n_kv, kv_repeat, D, L] and reshape to [B, H, D, L]
-        k_t = key_cache.transpose(-2, -1)  # [B, n_kv, D, L]
-        k_t_expanded = k_t.unsqueeze(2).expand(B, n_kv, kv_repeat, D, L).reshape(B, H, D, L)
+        # Gather K one block at a time and run scaled_bmm per block.
+        #
+        # (a) scaled_bmm requires the K operand's last dim to be exactly one
+        #     FP8 stick (128 elements).  Concatenating all blocks would produce
+        #     a multi-stick tensor that the hardware cannot lower.
+        #     Fix: index_select one block per scaled_bmm call; cat scores after.
+        #
+        # (b) Permute/reshape on already-encoded FP8 tensors destroys the element
+        #     arrangement.  Only index_select + squeeze/unsqueeze (no-layout ops)
+        #     are safe on an encoded FP8 weight tensor at attention time.
+        #
+        # (c) GQA broadcast: scaled_bmm supports K with fewer heads than Q
+        #     (n_kv < H).  After index_select → squeeze/unsqueeze, K is
+        #     [n_kv, 1, D, FP8_BLOCK_SIZE] while Q is [n_kv, kv_repeat, S, D];
+        #     the hardware broadcasts the same K head across kv_repeat Q heads.
+        #
+        # (d) Constructing index tensors inside torch.compile is not supported
+        #     on Spyre.  Block index tensors must be pre-built outside the
+        #     compiled graph and passed in as arguments.
 
-        # FP8 × FP8 → FP16: scores_raw [B, H, S, L]
-        scores_raw = torch.ops.spyre.scaled_bmm(q_fp8, k_t_expanded, out_dtype=torch.float16)
+        # Quantize Q per-token → QFP8CH [n_kv, kv_repeat, S, D].
+        # When compiling, pass q_scale as a pre-built device tensor argument;
+        # computing it inside the graph may produce a very small intermediate
+        # that the hardware scheduler cannot lower.  None-fallback is fine for
+        # eager / CPU mode.
+        q_gqa = q.reshape(n_kv, kv_repeat, S, D)            # [n_kv, kv_repeat, S, D]
+        q_fp16 = q_gqa.to(torch.float16)
+        if q_scale is None:
+            q_scale = torch.ops.spyre.quantscalepertokenfp8(q_fp16)
+        q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_fp16, q_scale)
+        # q_fp8: [n_kv, kv_repeat, S, D]
 
-        # Scale compensation: scores = scores_raw × q_scale × k_scale × (1/√D)
-        # q_scale: [B, H, S, 1], k_scale: [B, n_kv, L] → expand to [B, H, 1, L]
-        k_scale_expanded = k_scale.unsqueeze(2).expand(B, n_kv, kv_repeat, L).reshape(B, H, L)
-        scores = scores_raw * q_scale * k_scale_expanded.unsqueeze(-2) * scaling
+        # Per-block FP8 QK^T via index_select + scaled_bmm.
+        # block_indices must be a pre-built device tensor passed in as a graph
+        # argument; creating it inside compile (torch.tensor([b]).to(device))
+        # is not supported on Spyre.
+        if block_indices is None:
+            # Eager / CPU path: build on CPU then move to device.
+            block_indices = torch.arange(NUM_BLOCKS, dtype=torch.int32).unsqueeze(1).to(
+                key_cache.device
+            )  # [NUM_BLOCKS, 1]
+        # Static Python loop — torch.compile unrolls at trace time.
+        block_scores: list[torch.Tensor] = []
+        for b in range(NUM_BLOCKS):
+            b_idx = block_indices[b]  # [1] int32 — slice of a pre-built device tensor
+            k_blk = key_cache.index_select(0, b_idx)        # [1, n_kv, D, FP8_BLOCK_SIZE]
+            k_b   = k_blk.squeeze(0).unsqueeze(1)           # [n_kv, 1, D, FP8_BLOCK_SIZE]
+            sk_b  = key_scale_cache.index_select(0, b_idx)  # [1, 1, 1, 1]
 
-        # Apply causal mask (additive, -inf for masked positions)
+            # FP8 QK^T — GQA broadcast: K has n_kv heads, Q has n_kv*kv_repeat heads.
+            # mat1 [n_kv, kv_repeat, S, D]
+            # mat2 [n_kv, 1,         D, 128]
+            sc_b = torch.ops.spyre.scaled_bmm(q_fp8, k_b, out_dtype=torch.float16)
+            sc_b = sc_b * q_scale * sk_b * scaling          # [n_kv, kv_repeat, S, 128]
+            block_scores.append(sc_b.to(compute_dtype))
+
+        # cat across blocks → [n_kv, kv_repeat, S, total_L]
+        scores_committed = torch.cat(block_scores, dim=-1)
+
+        # DL16 tail scores (decode tokens not yet in a full committed block).
+        if key_tail_buf is not None:
+            # key_tail_buf [B, n_kv, FP8_BLOCK_SIZE, D] → k_tail [n_kv, 1, D, FP8_BLOCK_SIZE]
+            k_tail = key_tail_buf[0].permute(0, 2, 1).unsqueeze(1)
+            scores_tail = torch.matmul(
+                q_gqa.to(compute_dtype), k_tail.to(compute_dtype)
+            ) * scaling                                      # [n_kv, kv_repeat, S, FP8_BLOCK_SIZE]
+            scores = torch.cat([scores_committed, scores_tail], dim=-1)
+        else:
+            scores = scores_committed
+
         if attn_mask is not None:
+            # attn_mask [1, 1, S, total_L+tail] broadcasts over [n_kv, kv_repeat, ...].
             scores = scores + attn_mask.to(scores.dtype)
 
-        attn_weights = torch.softmax(scores, dim=-1).to(compute_dtype)
+        attn_weights = torch.softmax(scores, dim=-1, dtype=compute_dtype)
+
+        # AV multiply — committed V + tail V.
+        # value_cache [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]
+        # → permute(2,0,1,3) → [n_kv, NUM_BLOCKS, FP8_BLOCK_SIZE, D]
+        # → reshape → [n_kv, total_L, D] → unsqueeze(1) → [n_kv, 1, total_L, D]
+        v_flat = (
+            value_cache
+            .permute(2, 0, 1, 3)
+            .reshape(n_kv, total_L, D)
+            .unsqueeze(1)
+        )  # [n_kv, 1, total_L, D]
+
+        if value_tail_buf is not None:
+            v_tail = value_tail_buf[0].unsqueeze(1)          # [n_kv, 1, FP8_BLOCK_SIZE, D]
+            v_full = torch.cat([v_flat, v_tail], dim=2)      # [n_kv, 1, total_L+FP8_BLOCK_SIZE, D]
+        else:
+            v_full = v_flat
+
+        # attn_weights [n_kv, kv_repeat, S, total_L+tail] @ v_full [n_kv, 1, total_L+tail, D]
+        # → [n_kv, kv_repeat, S, D] → reshape → [B, H, S, D]
+        attn_out = torch.matmul(attn_weights, v_full.to(compute_dtype))
+        return attn_out.reshape(B, H, S, D)
+
     else:
-        # -----------------------------------------------------------------
-        # Option 2 fallback (CPU): dequantize K → DL16, run DL16 QK^T
-        # -----------------------------------------------------------------
+        # ── Option 2 (Spyre + CPU): dequantize K → DL16, torch.matmul ────
+        # key_cache: [B, n_kv, L, D] QFP8CH
+        n_kv = key_cache.shape[1]
+        kv_repeat = H // n_kv
+        L = key_cache.shape[2]
+        k_scale = key_scale_cache[:, :, :L, :]  # [B, n_kv, L, 1]
+
         k_dl16 = (
             key_cache.to(torch.float16)
-            * k_scale.unsqueeze(-1).to(torch.float16)
+            * k_scale.to(torch.float16)
         ).to(compute_dtype)
         k_expanded = k_dl16.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D]
+
         logits = torch.matmul(q, k_expanded.transpose(-2, -1)) * scaling
         if attn_mask is not None:
             logits = logits + attn_mask
+
         attn_weights = torch.softmax(logits, dim=-1, dtype=compute_dtype)
 
-    # AV multiply: DL16 matmul.  V is stored unquantized.
-    v_expanded = value_cache.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D_v]
-    attn_out = torch.matmul(attn_weights, v_expanded)             # [B, H, S, D_v]
-    return attn_out
+        v_expanded = value_cache.repeat_interleave(kv_repeat, dim=1)  # [B, H, L, D_v]
+        attn_out = torch.matmul(attn_weights, v_expanded)
+        return attn_out
 
 
 # ---------------------------------------------------------------------------
@@ -255,96 +564,113 @@ def allocate_fp8_kv_cache_tensors(
     head_dim: int,
     compute_dtype: torch.dtype,
     device=None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate (key_cache_fp8, key_scale_cache, value_cache) triplet.
+    *,
+    option: int = 1,
+):
+    """Allocate FP8 KV cache tensors.
 
-    ``key_cache`` is FP8 E4M3 allocated with a scatter-ready
-    ``SpyreTensorLayout`` on Spyre using ``ElementArrangement.QFP8CH``:
-    L (cache-position) sits at device position 0 (required for
-    ``index_copy_`` indirect scatter) and the stick dimension covers
-    ``head_dim`` with 128-element FP8 sticks.
+    **Option 1 returns a 4-tuple:**
+    ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``
 
-    **Why QFP8CH?** ``quantize_fp8_with_scale`` produces FP8 tensors in
-    ``QFP8CH`` element arrangement (within-stick element order differs from
-    ``STANDARD``), and ``fp8todl16`` (inside ``dequantize_fp8_with_scale``)
-    reads FP8 in ``QFP8CH`` arrangement.  Writing QFP8CH-arranged FP8 into a
-    ``STANDARD``-arranged cache silently corrupts data (same ``stickSize=128``
-    but wrong within-stick order), producing ``max_abs ≈ 0.43`` error on device.
-    Allocating with ``QFP8CH`` ensures the scatter write and the fp8todl16 read
-    use the same element ordering.
+    **Option 2 returns a 3-tuple:**
+    ``(key_cache, key_scale_cache, value_cache)``
 
-    ``key_scale_cache`` is allocated as a compact **3D** ``[B, n_kv, L]`` DL16
-    tensor — one scalar per token per KV head.  The sub-stick scatter fix in
-    ``superdsc.py`` (``feat/fp8-paged-attention-substick-scatter``, cherry-picked
-    into ``feat/fp8-kv-cache-opt2``) enables this shape on Spyre by correctly
-    handling the sub-stick ``index_copy_`` for size-1-trailing-dim destinations.
-    Memory cost: ``2 × B × n_kv × L`` bytes — ~128× smaller than K cache.
+    Option 1 shapes (Spyre):
+      ``key_cache``       ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` FP8 QFP8WT
+      ``key_scale_cache`` ``[NUM_BLOCKS, 1, 1, 1]``                 compute dtype
+      ``value_cache``     ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` compute dtype
+      ``key_tail_buf``    ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype
+      ``value_tail_buf``  ``[B, n_kv, FP8_BLOCK_SIZE, D]``          compute dtype
+      (both tail buffers are the 4th element, packed as a 2-tuple)
 
-    ``value_cache`` uses the standard scatter-ready 4D DL16 allocation.
+    Option 2 shapes:
+      ``key_cache``       ``[B, n_kv, L, D]`` FP8 QFP8CH
+      ``key_scale_cache`` ``[B, n_kv, L, 1]`` compute dtype
+      ``value_cache``     ``[B, n_kv, L, D]`` compute dtype
+
+    Args:
+        batch_size: B.
+        num_kv_heads: n_kv.
+        max_cache_len: L (max sequence / cache length).
+            For Option 1 must be a multiple of ``FP8_BLOCK_SIZE``.
+        head_dim: D.  For Option 1 must equal ``FP8_BLOCK_SIZE`` (128).
+        compute_dtype: dtype for scales, V, and tail buffers.
+        device: target device.
+        option: 1 = block-scatter QFP8WT layout; 2 = QFP8CH standard layout.
     """
     if device is None:
         from hf_adapters.hf_common import DEVICE
         device = DEVICE
 
-    from hf_adapters.hf_common import _cache_position_first_stl
-
-    shape_k = (batch_size, num_kv_heads, max_cache_len, head_dim)
-    shape_v = (batch_size, num_kv_heads, max_cache_len, head_dim)
-
-    # FP8 key cache: scatter-ready position-first layout on Spyre, with
-    # ElementArrangement.QFP8CH.
-    #
-    # ElementArrangement.QFP8CH is required because:
-    #   1. ``quantize_fp8_with_scale`` (qfp8ch op) produces FP8 tensors in
-    #      QFP8CH element arrangement (within-stick element order differs from
-    #      STANDARD FP8).
-    #   2. ``fp8todl16`` (used by ``dequantize_fp8_with_scale``) reads FP8
-    #      tensors in QFP8CH element arrangement.
-    # Writing QFP8CH-arranged FP8 into a STANDARD-arranged cache corrupts
-    # the data silently (same stickSize=128, but wrong within-stick order).
     on_spyre = torch.device(device).type == "spyre"
-    stl = None
-    if on_spyre:
-        try:
-            torch.empty(1, device="spyre")
-            from torch_spyre._C import ElementArrangement  # type: ignore[import-not-found]
-            stl = _cache_position_first_stl(
-                batch_size, num_kv_heads, max_cache_len, head_dim, FP8_DTYPE,
-                element_arrangement=ElementArrangement.QFP8CH,
-            )
-        except Exception:  # noqa: BLE001
-            stl = None
-    if stl is None:
-        key_cache = torch.zeros(shape_k, dtype=FP8_DTYPE, device=device)
-    else:
-        key_cache = torch.empty(  # type: ignore[call-overload]
-            shape_k,
-            device=torch.device(device),
-            device_layout=stl,
-            dtype=FP8_DTYPE,
-        )
-        # FillDMA does not support SEN143_FP8 — zero via uint8 reinterpret
-        # (bit pattern of FP8 zero == uint8 zero).
-        key_cache.view(torch.uint8).zero_()
 
-    from hf_adapters.hf_common import allocate_kv_cache_tensor, _scale_cache_position_first_stl
-    # key_scale_cache: compact 3D [B, n_kv, L] — one scalar per token per KV head.
-    # On Spyre, use _scale_cache_position_first_stl so L sits at device position 0
-    # (scatter-ready).  On CPU, plain zeros (device_layout kwarg unsupported).
-    scale_stl = _scale_cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, compute_dtype) if on_spyre else None
-    if scale_stl is None:
+    from hf_adapters.hf_common import allocate_kv_cache_tensor
+
+    if option == 1:
+        # ── Option 1: block layout ─────────────────────────────────────────
+        assert max_cache_len % FP8_BLOCK_SIZE == 0, (
+            f"Option 1: max_cache_len={max_cache_len} must be a multiple of "
+            f"FP8_BLOCK_SIZE={FP8_BLOCK_SIZE}"
+        )
+        NUM_BLOCKS = max_cache_len // FP8_BLOCK_SIZE
+
+        # key_cache: [NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE] FP8 QFP8WT.
+        # Allocated as CPU zeros then moved — avoids RuntimeOperationFill on QFP8WT.
+        shape_k = (NUM_BLOCKS, num_kv_heads, head_dim, FP8_BLOCK_SIZE)
+        key_cache = torch.zeros(shape_k, dtype=FP8_DTYPE).to(device)
+
+        # key_scale_cache: [NUM_BLOCKS, 1, 1, 1] — one scalar per block.
+        # Allocate as plain zeros (no STL needed for this tiny tensor).
         key_scale_cache = torch.zeros(
-            (batch_size, num_kv_heads, max_cache_len), dtype=compute_dtype, device=device
+            (NUM_BLOCKS, 1, 1, 1), dtype=compute_dtype, device=device
         )
+
+        # value_cache: [NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D] DL16 token-major.
+        shape_v = (NUM_BLOCKS, FP8_BLOCK_SIZE, num_kv_heads, head_dim)
+        value_cache = torch.zeros(shape_v, dtype=compute_dtype, device=device)
+
+        # Tail buffers: [B, n_kv, FP8_BLOCK_SIZE, D] DL16 — decode staging.
+        # Fixed-shape: always FP8_BLOCK_SIZE slots regardless of how many are filled.
+        # Positions beyond tail_pos are zero and masked by attn_mask.
+        shape_tail = (batch_size, num_kv_heads, FP8_BLOCK_SIZE, head_dim)
+        key_tail_buf = torch.zeros(shape_tail, dtype=compute_dtype, device=device)
+        value_tail_buf = torch.zeros(shape_tail, dtype=compute_dtype, device=device)
+
+        return key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf)
+
     else:
-        key_scale_cache = torch.empty(  # type: ignore[call-overload]
-            (batch_size, num_kv_heads, max_cache_len),
-            dtype=compute_dtype,
-            device=torch.device(device),
-            device_layout=scale_stl,
+        # ── Option 2 / CPU: standard [B, n_kv, L, D] layout ──────────────
+        if on_spyre:
+            from hf_adapters.hf_common import _cache_position_first_stl
+            from torch_spyre._C import ElementArrangement  # type: ignore[import-not-found]
+            try:
+                stl = _cache_position_first_stl(
+                    batch_size, num_kv_heads, max_cache_len, head_dim, FP8_DTYPE,
+                    element_arrangement=ElementArrangement.QFP8CH,
+                )
+            except Exception:  # noqa: BLE001
+                stl = None
+
+            shape_k = (batch_size, num_kv_heads, max_cache_len, head_dim)
+            if stl is None:
+                key_cache = torch.zeros(shape_k, dtype=FP8_DTYPE, device=device)
+            else:
+                key_cache = torch.empty(  # type: ignore[call-overload]
+                    shape_k,
+                    device=torch.device(device),
+                    device_layout=stl,
+                    dtype=FP8_DTYPE,
+                )
+                key_cache.view(torch.uint8).zero_()
+        else:
+            shape_k = (batch_size, num_kv_heads, max_cache_len, head_dim)
+            key_cache = torch.zeros(shape_k, dtype=FP8_DTYPE, device=device)
+
+        # Key scale cache: [B, n_kv, L, 1].
+        key_scale_cache = allocate_kv_cache_tensor(
+            batch_size, num_kv_heads, max_cache_len, 1, compute_dtype, device
         )
-        key_scale_cache.zero_()
-    value_cache = allocate_kv_cache_tensor(
-        batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
-    )
-    return key_cache, key_scale_cache, value_cache
+        value_cache = allocate_kv_cache_tensor(
+            batch_size, num_kv_heads, max_cache_len, head_dim, compute_dtype, device
+        )
+        return key_cache, key_scale_cache, value_cache

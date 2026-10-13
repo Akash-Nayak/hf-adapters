@@ -1523,18 +1523,29 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     return key_caches, value_caches
 
 
-def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
+def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None, *, option: int = 1):
     """Allocate per-layer FP8 KV cache tensors for use with ``Fp8KVStandardGQABlock``.
 
     Returns ``(key_caches, key_scale_caches, value_caches)`` where:
 
-    * ``key_caches[i]``       — ``[B, n_kv, L, head_dim]`` ``float8_e4m3fn``
-    * ``key_scale_caches[i]`` — ``[B, n_kv, L]`` ``dtype`` (one scalar per token per KV head)
-    * ``value_caches[i]``     — ``[B, n_kv, L, head_dim]`` ``dtype``
+    * ``key_caches[i]``       — FP8 key cache (shape depends on ``option``):
+                                 option 1: ``[NUM_BLOCKS, n_kv, D, FP8_BLOCK_SIZE]`` QFP8WT.
+                                 option 2: ``[B, n_kv, L, D]`` QFP8CH (standard).
+    * ``key_scale_caches[i]`` — option 1: ``[NUM_BLOCKS, 1, 1, 1]`` dtype.
+                                 option 2: ``[B, n_kv, L, 1]`` dtype.
+    * ``value_caches[i]``     — option 1: ``[NUM_BLOCKS, FP8_BLOCK_SIZE, n_kv, D]`` dtype.
+                                 option 2: ``[B, n_kv, L, head_dim]`` dtype.
 
-    ``dtype`` is the compute dtype (BF16 or FP16) used for activations and V.
-    The scale cache is 3D (no trailing size-1 dim) to avoid the Spyre inductor
-    ``ranges_from_index_vars`` crash in compiled scatter graphs.
+    For option 1 the caller must also track ``key_tail_bufs`` and ``value_tail_bufs``
+    (the 4th element from
+    :func:`~hf_adapters.fp8_kv_cache.allocate_fp8_kv_cache_tensors`, which returns
+    a 4-tuple ``(key_cache, key_scale_cache, value_cache, (key_tail_buf, value_tail_buf))``).
+    Call :func:`~hf_adapters.fp8_kv_cache.allocate_fp8_kv_cache_tensors` directly per-layer
+    to obtain the tail buffers; this function discards them.
+
+    Args:
+        option: 1 = block-scatter QFP8WT layout (Option 1 direct-FP8-matmul).
+                2 = QFP8CH standard layout (Option 2 dequantize-K).
     """
     from hf_adapters.fp8_kv_cache import allocate_fp8_kv_cache_tensors
 
@@ -1545,19 +1556,26 @@ def allocate_fp8_kv_caches(model, batch_size, max_cache_len, dtype, device=None)
     key_scale_caches = []
     value_caches = []
     for (n_kv, hd, vhd) in shapes:
-        kc, ksc, vc = allocate_fp8_kv_cache_tensors(
-            batch_size, n_kv, max_cache_len, hd, dtype, device
+        result = allocate_fp8_kv_cache_tensors(
+            batch_size, n_kv, max_cache_len, hd, dtype, device, option=option,
         )
+        if option == 1:
+            kc, ksc, vc, _tail_bufs = result
+        else:
+            kc, ksc, vc = result
         key_caches.append(kc)
         key_scale_caches.append(ksc)
         # V uses vhd (may differ from hd for models like Gemma 4)
         if vhd != hd:
-            _, _, vc = allocate_fp8_kv_cache_tensors(
-                batch_size, n_kv, max_cache_len, vhd, dtype, device
+            v_result = allocate_fp8_kv_cache_tensors(
+                batch_size, n_kv, max_cache_len, vhd, dtype, device, option=option,
             )
+            if option == 1:
+                _, _, vc, _tail_bufs = v_result
+            else:
+                _, _, vc = v_result
         value_caches.append(vc)
     return key_caches, key_scale_caches, value_caches
-
 
 
 # ---------------------------------------------------------------------------
@@ -2352,8 +2370,9 @@ def generate(
         kv_alloc_before_b = kv_reserved_before_b = None
 
     if use_fp8_kv:
+        _fp8_kv_opt = getattr(model, "_spyre_fp8_kv_opt", 1)
         key_caches, key_scale_caches, value_caches = allocate_fp8_kv_caches(
-            model, batch_size, max_cache_len, model_d_type
+            model, batch_size, max_cache_len, model_d_type, option=_fp8_kv_opt,
         )
     else:
         key_caches, value_caches = allocate_kv_caches(
@@ -2898,7 +2917,6 @@ def prepare_standard_gqa_blocks(layers, is_res_mul: bool | None = None):
     return blocks
 
 
-
 class Fp8KVStandardGQAAttention(StandardGQAAttention):
     """``StandardGQAAttention`` variant that stores K as FP8 and runs QK^T in FP8.
 
@@ -2910,7 +2928,16 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
 
     ``pre_attn`` returns ``(q, key_cache, key_scale_cache, value_cache)``
     so that ``StandardGQABlock._region_attention_tail`` receives them.
+
+    Args:
+        layer_self_attn: the original layer's ``self_attn`` module.
+        fp8_kv_opt: 1 = Option 1 (direct-FP8-matmul via ``scaled_bmm``);
+                    2 = Option 2 (dequantize-K via ``torch.matmul``).
     """
+
+    def __init__(self, layer_self_attn, fp8_kv_opt: int = 1):
+        super().__init__(layer_self_attn)
+        self._fp8_kv_opt = fp8_kv_opt
 
     def pre_attn(
         self,
@@ -2943,10 +2970,9 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
-        key_cache, key_scale_cache, value_cache, _k_fp8, _k_scale = (
-            fp8_kv_cache_update(
-                k, v, key_cache, key_scale_cache, value_cache, cache_index
-            )
+        key_cache, key_scale_cache, value_cache = fp8_kv_cache_update(
+            k, v, key_cache, key_scale_cache, value_cache, cache_index,
+            option=self._fp8_kv_opt,
         )
         return q, key_cache, key_scale_cache, value_cache
 
@@ -2958,6 +2984,7 @@ class Fp8KVStandardGQAAttention(StandardGQAAttention):
         attn_out = fp8_attn_core(
             q, key_cache, key_scale_cache, value_cache,
             attn_mask, self.scaling, compute_dtype,
+            option=self._fp8_kv_opt,
         )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -2985,11 +3012,16 @@ class Fp8KVStandardGQABlock(nn.Module):
 
     The block signature gains one extra cache tensor: the key scale cache.
     ``forward`` threads it through untouched between the two compiled regions.
+
+    Args:
+        layer: original decoder layer.
+        is_res_mul: whether the layer uses a residual multiplier.
+        fp8_kv_opt: 1 = Option 1 (direct-FP8-matmul); 2 = Option 2 (dequantize-K).
     """
 
-    def __init__(self, layer, is_res_mul: bool | None = None):
+    def __init__(self, layer, is_res_mul: bool | None = None, fp8_kv_opt: int = 1):
         super().__init__()
-        self.self_attn = Fp8KVStandardGQAAttention(layer.self_attn)
+        self.self_attn = Fp8KVStandardGQAAttention(layer.self_attn, fp8_kv_opt=fp8_kv_opt)
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
         self.post_attention_layernorm = layer.post_attention_layernorm
@@ -3054,16 +3086,24 @@ class Fp8KVStandardGQABlock(nn.Module):
         return h, key_cache, key_scale_cache, value_cache
 
 
-def prepare_standard_gqa_blocks_fp8_kv(layers, is_res_mul: bool | None = None):
+def prepare_standard_gqa_blocks_fp8_kv(
+    layers, is_res_mul: bool | None = None, fp8_kv_opt: int = 1
+):
     """Like ``prepare_standard_gqa_blocks`` but uses ``Fp8KVStandardGQABlock``.
 
     Replaces all decoder layers in-place with FP8 KV cache variants and
     returns the block list.  Call this instead of ``prepare_standard_gqa_blocks``
     in adapters that enable FP8 KV cache.
+
+    Args:
+        layers: model layer list to replace in-place.
+        is_res_mul: whether layers use a residual multiplier.
+        fp8_kv_opt: 1 = Option 1 (direct-FP8-matmul via ``scaled_bmm``);
+                    2 = Option 2 (dequantize-K via ``torch.matmul``).
     """
     blocks = []
     for i, layer in enumerate(list(layers)):
-        block = Fp8KVStandardGQABlock(layer, is_res_mul)
+        block = Fp8KVStandardGQABlock(layer, is_res_mul, fp8_kv_opt=fp8_kv_opt)
         layers[i] = block
         blocks.append(block)
     return blocks

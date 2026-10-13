@@ -26,13 +26,7 @@ FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
 SCALE_EPS = 1e-4  # CPU path: keeps reciprocal(x_scale) finite for all-zero rows
 
-# All projections run FP8 scaled_mm on the eval/fp8-prequant-with-hf-adapter
-# torch-spyre branch (feature/prequantized-fp8-weight-support base):
-#   - DtException on o_proj: fixed by _project_pointwise_dim_order rank_diff<0
-#     sparse-stick marker fix in propagate_layouts.py (commit 8a0b32e8)
-#   - ReStickifyOpHBM on SEN143_FP8 for down_proj: fixed by the same commit's
-#     _project_pointwise_dim_order and find_stick_compatible_input_layout guards
-# No exclusions needed on this branch.
+# All projections run FP8 scaled_mm with no layer exclusions required.
 DEFAULT_FP8_EXCLUDE: tuple[str, ...] = ()
 
 

@@ -84,7 +84,7 @@ NUM_PREFILL_BLOCKS = PREFILL_LEN // FP8_BLOCK_SIZE  # = 1
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _rand(dtype, *shape, device="cpu"):
+def _rand(dtype, *shape):
     return torch.randn(*shape, dtype=dtype)
 
 
@@ -101,11 +101,7 @@ def _sdpa_ref(q, k_full, v_full, scaling, n_kv, attn_mask=None):
 # ---------------------------------------------------------------------------
 
 class _Update(torch.nn.Module):
-    """Compiled cache update — option=2 (dequantize-K, QFP8CH fill).
-
-    Option 1 (direct-FP8-matmul) requires the backup compiler branch and is
-    tested separately once that branch passes ``test_fp8_scaled_mm_3d_batched``.
-    """
+    """Compiled cache update — option=2 (dequantize-K, QFP8CH fill)."""
     def forward(self, k, v, key_cache, key_scale_cache, value_cache, cache_index):
         return fp8_kv_cache_update(
             k, v, key_cache, key_scale_cache, value_cache, cache_index,
@@ -265,7 +261,6 @@ def test_fp8_attn_core_prefill_accuracy(dtype):
     attend_fn = torch.compile(_Attend(scaling, dtype), dynamic=False)
 
     # Valid mask for prefill: tokens 0..PREFILL_LEN-1 are valid, PREFILL_LEN..MAX_CACHE_LEN-1 are masked.
-    # On Spyre, finite large negative mask (-10000.0) is standard in DeepTools/inductor softmax.
     attn_mask_s = torch.full((1, 1, PREFILL_LEN, MAX_CACHE_LEN), -10000.0, dtype=dtype, device="spyre")
     attn_mask_s[:, :, :, :PREFILL_LEN] = 0.0
 
@@ -405,33 +400,30 @@ class _AttendOpt1(torch.nn.Module):
 class _FillAndAttendOpt1GQA(torch.nn.Module):
     """Fill K as QFP8WT + V as QFP8CH + attend with GQA broadcast — ONE compiled graph.
 
-    Mirrors ``TestFp8KvCacheQFP8WTDecodeEndToEndGQA`` in the torch-spyre test suite
-    exactly.  Fill and attend are compiled together so the QFP8WT ElementArrangement
-    on the key cache is visible end-to-end.
+    Fill and attend are compiled together so the QFP8WT element arrangement on
+    the key cache is visible end-to-end.
 
     V scale cache design
     --------------------
     ``quantscalepertokenfp8(v_in)`` for ``v_in`` of shape ``[1, BS, n_kv, D]``
     returns ``sv`` of shape ``[1, BS, n_kv, 1]``.  A DL16 stick holds 64 fp16
-    elements; the inner ``n_kv × 1 = 8`` elements per scatter slot are only 8,
-    which is a sub-stick scatter → ``ComputeHardwareError 0x7b1b``.
+    elements; the inner ``n_kv × 1 = 8`` elements per scatter slot are fewer
+    than one stick, which causes a partial-stick scatter — a hardware error.
 
-    Fix (matching torch-spyre): pad ``sv`` to ``[1, BS, n_kv, 64]`` via
-    ``F.pad(sv, (0, 63))`` before the scatter so every write covers exactly one
-    complete DL16 stick.  At read time slice back to ``[:, :, :, :1]`` inside
-    the compiled graph before passing to ``dequantize_fp8_with_scale``.
+    Fix: pad ``sv`` to ``[1, BS, n_kv, 64]`` via ``F.pad(sv, (0, 63))`` before
+    the scatter so every write covers exactly one complete DL16 stick.  At read
+    time slice back to ``[:, :, :, :1]`` inside the compiled graph before
+    passing to ``dequantize_fp8_with_scale``.
 
     Why *not* use ``sv`` as a live local
     -------------------------------------
-    ``dequantize_fp8_with_scale`` decomposes to ``fp8todl16(v_block) * scale``.
-    The pointwise scheduler must co-tile ``fp8todl16(v_block)`` (output:
-    128-elem DL16 sticks from the 128-elem FP8 sticks of the QFP8CH V cache)
-    with ``scale``.  When ``scale = sv`` is a live intermediate of shape
-    ``[1, BS, n_kv, 1]`` (1-elem last dim), the scheduler cannot match it to
-    the 128-elem DL16 stick loop from ``fp8todl16``, and the output is all-zeros.
-    Routing ``sv`` through the stick-aligned ``v_sc_cache`` (trailing dim 64)
-    and slicing back to ``[:,:,:,:1]`` gives the scale tensor the same DL16
-    stick provenance as the ``fp8todl16`` output, allowing correct co-tiling.
+    ``dequantize_fp8_with_scale`` decomposes to an FP8→FP16 conversion followed
+    by a pointwise multiply with the scale.  When ``scale = sv`` is a live
+    intermediate of shape ``[1, BS, n_kv, 1]`` (trailing dim = 1), the compiler
+    scheduler cannot co-tile it with the wider FP16 output of the FP8→FP16
+    conversion, and the pointwise produces zeros.  Routing ``sv`` through the
+    stick-aligned ``v_sc_cache`` (trailing dim 64) and slicing back to
+    ``[:,:,:,:1]`` gives the scale the correct provenance for co-tiling.
 
     Cache shapes:
       ``k_cache``    ``[NUM_BLOCKS, n_kv, D, BS]``       FP8 QFP8WT
@@ -482,7 +474,7 @@ class _FillAndAttendOpt1GQA(torch.nn.Module):
         sv_padded = F.pad(sv, (0, 63))                      # [1, BS, n_kv, 64]
         v_sc_cache.index_copy_(0, block, sv_padded)
 
-        # ── Decode: gather K (QFP8WT EA preserved within this graph) ─────────
+        # ── Decode: gather K (QFP8WT element arrangement preserved) ─────────
         k_block = k_cache.index_select(0, block)            # [1, n_kv, D, BS]
         sk_block = k_sc_cache.index_select(0, block)        # [1, 1, 1, 1]
 
@@ -502,13 +494,12 @@ class _FillAndAttendOpt1GQA(torch.nn.Module):
         v_block = v_cache.index_select(0, block)            # [1, BS, n_kv, D]
         sv_block = v_sc_cache.index_select(0, block)        # [1, BS, n_kv, 64]
         # Slice back to [1, BS, n_kv, 1] — only element 0 carries the real scale.
-        # The scale went through the 64-wide stick-aligned cache so its DL16 layout
-        # matches the fp8todl16(v_block) output — co-tiling works correctly.
+        # The scale passed through the 64-wide stick-aligned cache, giving it the
+        # correct provenance for co-tiling with the dequantize output.
         v_dq = torch.ops.spyre.dequantize_fp8_with_scale(v_block, sv_block[:, :, :, :1])
-        # [1, BS, n_kv, D] → [1, n_kv, BS, D]: squeeze batch, permute token/head dims
-        # GQA broadcast: reshape probs [1, H, 1, BS] → [1, n_kv, gqa, BS] so the
-        # matmul naturally tiles over (n_kv, gqa) without repeat_interleave, which
-        # triggers a lossy work-division scheduler path for (n_kv=8, gqa=4, H=32).
+        # GQA broadcast: reshape probs [1, H, 1, BS] → [1, n_kv, gqa, BS] and
+        # v_dq [1, BS, n_kv, D] → [1, n_kv, BS, D].  This avoids repeat_interleave
+        # on the V head dimension, which fails for large H on this device.
         v_3d = v_dq.squeeze(0).permute(1, 0, 2).unsqueeze(0)   # [1, n_kv, BS, D]
         probs_4d = probs.reshape(1, n_kv, gqa, -1)              # [1, n_kv, gqa, BS]
         out = torch.matmul(probs_4d, v_3d)                      # [1, n_kv, gqa, D]
@@ -602,8 +593,7 @@ def test_fp8_opt1_decode_accuracy(dtype):
 
     The fill and attention are compiled together in one graph
     (``_FillAndAttendOpt1GQA``) so the QFP8WT key cache layout is visible
-    end-to-end.  This mirrors the ``test_fp8_qfp8wt_cache_fill_and_decode_gqa``
-    test from the torch-spyre suite (class ``TestFp8KvCacheQFP8WTDecodeEndToEndGQA``).
+    end-to-end.
 
     Sequence:
       1. Compile ``_FillAndAttendOpt1GQA``: fill one block of K/V, decode with
@@ -632,8 +622,8 @@ def test_fp8_opt1_decode_accuracy(dtype):
     v_cache = torch.zeros((NUM_BLOCKS, FP8_BLOCK_SIZE, N_KV, HEAD_DIM),
                           dtype=torch.float8_e4m3fn).to("spyre")
     # V scale cache: trailing dim padded to 64 (one full DL16 stick) to avoid
-    # sub-stick scatter (ComputeHardwareError 0x7b1b) and to give the scale the
-    # correct DL16 stick provenance needed by dequantize_fp8_with_scale co-tiling.
+    # partial-stick scatter and to give the scale the correct provenance for
+    # co-tiling with the dequantize_fp8_with_scale output.
     v_sc_cache = torch.zeros((NUM_BLOCKS, FP8_BLOCK_SIZE, N_KV, 64),
                              dtype=torch.float16).to("spyre")
 
